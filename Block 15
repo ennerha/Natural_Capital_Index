@@ -1,0 +1,631 @@
+# ============================================================
+# BRAZIL NCI-BR PROJECT
+# BLOCK 15 — NCI-BR UNCERTAINTY AND SENSITIVITY ANALYSIS
+# REAL DATA ONLY — MONTE CARLO WEIGHT PERTURBATION
+# ============================================================
+
+import os
+import json
+import logging
+from pathlib import Path
+from datetime import datetime
+
+import pandas as pd
+import geopandas as gpd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ------------------------------------------------------------
+# 1. Reload configuration
+# ------------------------------------------------------------
+
+PROJECT_ROOT = Path("/content/drive/MyDrive/Brazil/NCI_BR_Project")
+
+DIRS = {
+    "root": PROJECT_ROOT,
+    "raw": PROJECT_ROOT / "01_raw",
+    "intermediate": PROJECT_ROOT / "02_intermediate",
+    "processed": PROJECT_ROOT / "03_processed",
+    "tables": PROJECT_ROOT / "04_tables",
+    "figures": PROJECT_ROOT / "05_figures",
+    "maps": PROJECT_ROOT / "06_maps",
+    "exports": PROJECT_ROOT / "07_exports",
+    "logs": PROJECT_ROOT / "08_logs",
+    "metadata": PROJECT_ROOT / "09_metadata"
+}
+
+config_path = DIRS["metadata"] / "nci_br_config.json"
+
+with open(config_path, "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
+
+BASELINE_YEAR = int(CONFIG["baseline_year"])
+
+# ------------------------------------------------------------
+# 2. Logging
+# ------------------------------------------------------------
+
+log_file = DIRS["logs"] / f"nci_br_block15_uncertainty_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+logging.basicConfig(
+    filename=log_file,
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+logger = logging.getLogger("NCI_BR_BLOCK15")
+logger.info("Block 15 started.")
+
+print(f"Log file created at: {log_file}")
+
+# ------------------------------------------------------------
+# 3. Load integrated NCI-BR dataset
+# ------------------------------------------------------------
+
+nci_path = DIRS["processed"] / "nci_br_grid_integrated_index.gpkg"
+
+if not nci_path.exists():
+    raise FileNotFoundError("Integrated NCI-BR file not found. Run Block 06 first.")
+
+gdf = gpd.read_file(nci_path)
+
+if gdf.crs is None:
+    gdf = gdf.set_crs(CONFIG["output_crs"])
+
+gdf = gdf.to_crs(CONFIG["output_crs"])
+
+print(f"NCI-BR dataset loaded: {len(gdf)} cells")
+
+# ------------------------------------------------------------
+# 4. Define NCI-BR component variables
+# ------------------------------------------------------------
+
+component_candidates = {
+    "native_vegetation": "score_native_vegetation",
+    "vegetation_condition": "score_vegetation_condition",
+    "hydrological_regulation": "score_hydrological_regulation",
+    "low_anthropic_pressure": "score_low_anthropic_pressure",
+    "floodplain_function": "score_floodplain_function",
+    "vegetation_trend": "score_vegetation_trend"
+}
+
+components = {
+    k: v for k, v in component_candidates.items()
+    if v in gdf.columns
+}
+
+if len(components) < 3:
+    raise ValueError(f"Too few NCI-BR components found: {components}")
+
+for col in components.values():
+    gdf[col] = pd.to_numeric(gdf[col], errors="coerce")
+
+gdf = gdf.dropna(subset=list(components.values())).copy()
+
+print("Components used:")
+for k, v in components.items():
+    print(f"  {k}: {v}")
+
+# ------------------------------------------------------------
+# 5. Baseline weights from Block 06
+# ------------------------------------------------------------
+
+baseline_weights = {
+    "native_vegetation": 0.30,
+    "vegetation_condition": 0.20,
+    "hydrological_regulation": 0.20,
+    "low_anthropic_pressure": 0.15,
+    "floodplain_function": 0.10,
+    "vegetation_trend": 0.05
+}
+
+baseline_weights = {
+    k: baseline_weights[k]
+    for k in components.keys()
+}
+
+# Renormalize if some components are missing
+total_w = sum(baseline_weights.values())
+baseline_weights = {k: v / total_w for k, v in baseline_weights.items()}
+
+print("\nBaseline weights used:")
+print(baseline_weights)
+
+# ------------------------------------------------------------
+# 6. Helper functions
+# ------------------------------------------------------------
+
+def minmax_0_100(x):
+    x = np.asarray(x, dtype=float)
+    xmin = np.nanmin(x)
+    xmax = np.nanmax(x)
+
+    if xmax == xmin:
+        return np.full_like(x, np.nan)
+
+    return (x - xmin) / (xmax - xmin) * 100
+
+def compute_weighted_index(df, components, weights):
+    score = np.zeros(len(df), dtype=float)
+
+    for comp_name, col in components.items():
+        score += df[col].values * weights[comp_name]
+
+    return minmax_0_100(score)
+
+# ------------------------------------------------------------
+# 7. Baseline recomputation
+# ------------------------------------------------------------
+
+gdf["NCI_BR_recomputed_baseline"] = compute_weighted_index(
+    gdf,
+    components,
+    baseline_weights
+)
+
+# ------------------------------------------------------------
+# 8. Monte Carlo weight perturbation
+# ------------------------------------------------------------
+# This does NOT create environmental data.
+# It only tests how sensitive the NCI-BR ranking is to weight uncertainty.
+
+N_SIM = 1000
+RANDOM_SEED = 42
+
+rng = np.random.default_rng(RANDOM_SEED)
+
+component_names = list(components.keys())
+baseline_weight_vector = np.array([baseline_weights[c] for c in component_names])
+
+# Dirichlet concentration controls how strongly simulations remain near baseline.
+# Higher = less variation; lower = more variation.
+DIRICHLET_CONCENTRATION = 80
+
+alpha = baseline_weight_vector * DIRICHLET_CONCENTRATION
+
+simulated_indices = np.zeros((len(gdf), N_SIM), dtype=np.float32)
+weight_records = []
+
+print(f"\nRunning Monte Carlo sensitivity analysis: {N_SIM} simulations...")
+
+for i in range(N_SIM):
+    sampled_weights = rng.dirichlet(alpha)
+
+    weights = {
+        comp: sampled_weights[j]
+        for j, comp in enumerate(component_names)
+    }
+
+    simulated_indices[:, i] = compute_weighted_index(
+        gdf,
+        components,
+        weights
+    )
+
+    row = {"simulation": i}
+    row.update({f"weight_{k}": v for k, v in weights.items()})
+    weight_records.append(row)
+
+weights_df = pd.DataFrame(weight_records)
+
+# ------------------------------------------------------------
+# 9. Uncertainty metrics per grid cell
+# ------------------------------------------------------------
+
+gdf["NCI_BR_mc_mean"] = np.nanmean(simulated_indices, axis=1)
+gdf["NCI_BR_mc_median"] = np.nanmedian(simulated_indices, axis=1)
+gdf["NCI_BR_mc_std"] = np.nanstd(simulated_indices, axis=1)
+gdf["NCI_BR_mc_p05"] = np.nanpercentile(simulated_indices, 5, axis=1)
+gdf["NCI_BR_mc_p25"] = np.nanpercentile(simulated_indices, 25, axis=1)
+gdf["NCI_BR_mc_p75"] = np.nanpercentile(simulated_indices, 75, axis=1)
+gdf["NCI_BR_mc_p95"] = np.nanpercentile(simulated_indices, 95, axis=1)
+gdf["NCI_BR_mc_iqr"] = gdf["NCI_BR_mc_p75"] - gdf["NCI_BR_mc_p25"]
+gdf["NCI_BR_mc_range90"] = gdf["NCI_BR_mc_p95"] - gdf["NCI_BR_mc_p05"]
+
+# Hotspot robustness
+baseline_q75 = gdf["NCI_BR_recomputed_baseline"].quantile(0.75)
+baseline_q90 = gdf["NCI_BR_recomputed_baseline"].quantile(0.90)
+
+gdf["prob_high_nci_q75"] = (simulated_indices >= baseline_q75).mean(axis=1)
+gdf["prob_very_high_nci_q90"] = (simulated_indices >= baseline_q90).mean(axis=1)
+
+def classify_robustness(p):
+    if p >= 0.90:
+        return "Very robust high-NCI"
+    elif p >= 0.75:
+        return "Robust high-NCI"
+    elif p >= 0.50:
+        return "Moderately robust high-NCI"
+    elif p >= 0.25:
+        return "Unstable high-NCI"
+    else:
+        return "Not robust high-NCI"
+
+gdf["high_nci_robustness_class"] = gdf["prob_high_nci_q75"].apply(classify_robustness)
+
+# ------------------------------------------------------------
+# 10. Sensitivity of ranking
+# ------------------------------------------------------------
+
+baseline_rank = gdf["NCI_BR_recomputed_baseline"].rank(ascending=False)
+
+rank_matrix = np.zeros((len(gdf), N_SIM), dtype=np.float32)
+
+for i in range(N_SIM):
+    rank_matrix[:, i] = pd.Series(
+        simulated_indices[:, i]
+    ).rank(ascending=False).values
+
+gdf["rank_baseline"] = baseline_rank.values
+gdf["rank_mc_mean"] = np.nanmean(rank_matrix, axis=1)
+gdf["rank_mc_std"] = np.nanstd(rank_matrix, axis=1)
+gdf["rank_mc_p05"] = np.nanpercentile(rank_matrix, 5, axis=1)
+gdf["rank_mc_p95"] = np.nanpercentile(rank_matrix, 95, axis=1)
+
+# ------------------------------------------------------------
+# 11. Component influence diagnostics
+# ------------------------------------------------------------
+
+component_corr_records = []
+
+for comp_name, col in components.items():
+    corr = np.corrcoef(
+        gdf[col].values,
+        gdf["NCI_BR_recomputed_baseline"].values
+    )[0, 1]
+
+    component_corr_records.append({
+        "component": comp_name,
+        "column": col,
+        "correlation_with_baseline_NCI": corr,
+        "baseline_weight": baseline_weights[comp_name]
+    })
+
+component_corr_df = pd.DataFrame(component_corr_records)
+
+# ------------------------------------------------------------
+# 12. Summary tables
+# ------------------------------------------------------------
+
+uncertainty_summary = pd.DataFrame([
+    {
+        "metric": "mean_mc_std",
+        "value": gdf["NCI_BR_mc_std"].mean(),
+        "unit": "NCI points"
+    },
+    {
+        "metric": "median_mc_std",
+        "value": gdf["NCI_BR_mc_std"].median(),
+        "unit": "NCI points"
+    },
+    {
+        "metric": "mean_mc_iqr",
+        "value": gdf["NCI_BR_mc_iqr"].mean(),
+        "unit": "NCI points"
+    },
+    {
+        "metric": "mean_prob_high_nci_q75",
+        "value": gdf["prob_high_nci_q75"].mean(),
+        "unit": "probability"
+    },
+    {
+        "metric": "cells_very_robust_high_nci",
+        "value": int((gdf["high_nci_robustness_class"] == "Very robust high-NCI").sum()),
+        "unit": "cells"
+    },
+    {
+        "metric": "cells_robust_or_very_robust_high_nci",
+        "value": int(gdf["high_nci_robustness_class"].isin([
+            "Very robust high-NCI",
+            "Robust high-NCI"
+        ]).sum()),
+        "unit": "cells"
+    },
+    {
+        "metric": "monte_carlo_simulations",
+        "value": N_SIM,
+        "unit": "runs"
+    }
+])
+
+robustness_summary = (
+    gdf.groupby("high_nci_robustness_class")
+    .agg(
+        n_cells=("grid_id", "count"),
+        mean_NCI_BR=("NCI_BR_recomputed_baseline", "mean"),
+        mean_uncertainty_std=("NCI_BR_mc_std", "mean"),
+        mean_prob_high_nci=("prob_high_nci_q75", "mean")
+    )
+    .reset_index()
+)
+
+# ------------------------------------------------------------
+# 13. Export outputs
+# ------------------------------------------------------------
+
+output_gpkg = DIRS["processed"] / "nci_br_uncertainty_sensitivity_analysis.gpkg"
+output_csv = DIRS["tables"] / "nci_br_uncertainty_sensitivity_analysis.csv"
+weights_csv = DIRS["tables"] / "nci_br_monte_carlo_weight_samples.csv"
+summary_csv = DIRS["tables"] / "nci_br_uncertainty_summary.csv"
+robustness_csv = DIRS["tables"] / "nci_br_high_nci_robustness_summary.csv"
+component_corr_csv = DIRS["tables"] / "nci_br_component_influence_diagnostics.csv"
+
+gdf.to_file(
+    output_gpkg,
+    layer="nci_uncertainty_sensitivity",
+    driver="GPKG"
+)
+
+gdf.drop(columns="geometry").to_csv(
+    output_csv,
+    index=False,
+    encoding="utf-8-sig"
+)
+
+weights_df.to_csv(
+    weights_csv,
+    index=False,
+    encoding="utf-8-sig"
+)
+
+uncertainty_summary.to_csv(
+    summary_csv,
+    index=False,
+    encoding="utf-8-sig"
+)
+
+robustness_summary.to_csv(
+    robustness_csv,
+    index=False,
+    encoding="utf-8-sig"
+)
+
+component_corr_df.to_csv(
+    component_corr_csv,
+    index=False,
+    encoding="utf-8-sig"
+)
+
+print("\nUncertainty/sensitivity outputs exported:")
+print(f"  {output_gpkg}")
+print(f"  {output_csv}")
+print(f"  {weights_csv}")
+print(f"  {summary_csv}")
+print(f"  {robustness_csv}")
+print(f"  {component_corr_csv}")
+
+# ------------------------------------------------------------
+# 14. High-quality composite figure
+# ------------------------------------------------------------
+
+plot_gdf = gdf.copy()
+
+fig = plt.figure(figsize=(16, 9), dpi=150)
+
+gs = fig.add_gridspec(
+    nrows=2,
+    ncols=3,
+    width_ratios=[1.25, 1.25, 1.05],
+    height_ratios=[1, 1],
+    wspace=0.22,
+    hspace=0.25
+)
+
+ax_a = fig.add_subplot(gs[0, 0])
+ax_b = fig.add_subplot(gs[0, 1])
+ax_c = fig.add_subplot(gs[0, 2])
+ax_d = fig.add_subplot(gs[1, 0])
+ax_e = fig.add_subplot(gs[1, 1])
+ax_f = fig.add_subplot(gs[1, 2])
+
+def add_panel_label(ax, label):
+    ax.text(
+        0.02,
+        0.96,
+        label,
+        transform=ax.transAxes,
+        fontsize=13,
+        fontweight="bold",
+        va="top",
+        ha="left",
+        bbox=dict(
+            facecolor="white",
+            edgecolor="none",
+            alpha=0.85,
+            boxstyle="round,pad=0.25"
+        )
+    )
+
+# Panel A — baseline NCI
+plot_gdf.plot(
+    column="NCI_BR_recomputed_baseline",
+    ax=ax_a,
+    legend=True,
+    cmap="YlGn",
+    linewidth=0,
+    missing_kwds={"color": "lightgrey"}
+)
+ax_a.set_title("Baseline NCI-BR", loc="left")
+ax_a.set_axis_off()
+add_panel_label(ax_a, "a")
+
+# Panel B — uncertainty
+plot_gdf.plot(
+    column="NCI_BR_mc_std",
+    ax=ax_b,
+    legend=True,
+    cmap="magma",
+    linewidth=0,
+    missing_kwds={"color": "lightgrey"}
+)
+ax_b.set_title("NCI-BR uncertainty: Monte Carlo SD", loc="left")
+ax_b.set_axis_off()
+add_panel_label(ax_b, "b")
+
+# Panel C — robustness
+robust_colors = {
+    "Very robust high-NCI": "#006837",
+    "Robust high-NCI": "#31a354",
+    "Moderately robust high-NCI": "#addd8e",
+    "Unstable high-NCI": "#fee08b",
+    "Not robust high-NCI": "#d9d9d9"
+}
+
+plot_gdf["robust_color"] = plot_gdf["high_nci_robustness_class"].map(robust_colors)
+
+plot_gdf.plot(
+    ax=ax_c,
+    color=plot_gdf["robust_color"],
+    linewidth=0
+)
+ax_c.set_title("Robustness of high-NCI classification", loc="left")
+ax_c.set_axis_off()
+add_panel_label(ax_c, "c")
+
+handles = [
+    plt.Line2D(
+        [0], [0],
+        marker="s",
+        linestyle="",
+        markersize=7,
+        markerfacecolor=color,
+        markeredgecolor="none",
+        label=label
+    )
+    for label, color in robust_colors.items()
+    if label in plot_gdf["high_nci_robustness_class"].unique()
+]
+
+ax_c.legend(
+    handles=handles,
+    loc="lower left",
+    fontsize=6.5,
+    frameon=True,
+    framealpha=0.9
+)
+
+# Panel D — baseline vs MC mean
+ax_d.scatter(
+    plot_gdf["NCI_BR_recomputed_baseline"],
+    plot_gdf["NCI_BR_mc_mean"],
+    s=10,
+    alpha=0.45
+)
+
+ax_d.plot([0, 100], [0, 100], linewidth=1)
+
+ax_d.set_title("Baseline NCI-BR vs Monte Carlo mean", loc="left")
+ax_d.set_xlabel("Baseline NCI-BR")
+ax_d.set_ylabel("Monte Carlo mean NCI-BR")
+ax_d.grid(True, linewidth=0.3, alpha=0.5)
+add_panel_label(ax_d, "d")
+
+# Panel E — component influence
+component_corr_plot = component_corr_df.sort_values(
+    "correlation_with_baseline_NCI"
+)
+
+ax_e.barh(
+    component_corr_plot["component"],
+    component_corr_plot["correlation_with_baseline_NCI"]
+)
+ax_e.axvline(0, linewidth=0.8)
+ax_e.set_title("Component influence on baseline NCI-BR", loc="left")
+ax_e.set_xlabel("Correlation")
+ax_e.grid(axis="x", linewidth=0.3, alpha=0.5)
+add_panel_label(ax_e, "e")
+
+# Panel F — summary table
+ax_f.axis("off")
+
+table_df = uncertainty_summary.copy()
+table_df["value"] = table_df["value"].map(
+    lambda x: f"{x:,.4f}" if isinstance(x, float) else f"{x}"
+)
+
+table = ax_f.table(
+    cellText=table_df[["metric", "value", "unit"]].values,
+    colLabels=["Metric", "Value", "Unit"],
+    loc="center",
+    cellLoc="center",
+    colLoc="center"
+)
+
+table.auto_set_font_size(False)
+table.set_fontsize(5.8)
+table.scale(1.0, 1.35)
+
+for (row, col), cell in table.get_celld().items():
+    cell.set_edgecolor("#bdbdbd")
+    cell.set_linewidth(0.5)
+
+    if row == 0:
+        cell.set_facecolor("#f0f0f0")
+        cell.set_text_props(weight="bold")
+
+ax_f.set_title("Uncertainty summary", loc="left")
+add_panel_label(ax_f, "f")
+
+fig.suptitle(
+    "Uncertainty and sensitivity of the Natural Capital Index",
+    fontsize=15,
+    fontweight="bold",
+    y=0.98
+)
+
+fig.text(
+    0.02,
+    0.02,
+    "Monte Carlo analysis perturbs only index weights around the baseline NCI-BR formulation. Environmental inputs remain observed datasets; no synthetic footprints or scenarios are used.",
+    fontsize=8,
+    color="#4d4d4d"
+)
+
+fig_png = DIRS["figures"] / "figure_13_nci_uncertainty_sensitivity.png"
+fig_pdf = DIRS["figures"] / "figure_13_nci_uncertainty_sensitivity.pdf"
+
+plt.savefig(fig_png, dpi=CONFIG["figure_dpi"], bbox_inches="tight")
+plt.savefig(fig_pdf, dpi=CONFIG["figure_dpi"], bbox_inches="tight")
+plt.show()
+
+print("\nFigure exported:")
+print(f"  {fig_png}")
+print(f"  {fig_pdf}")
+
+# ------------------------------------------------------------
+# 15. Save metadata
+# ------------------------------------------------------------
+
+block15_metadata = {
+    "block": "15",
+    "description": "Monte Carlo uncertainty and sensitivity analysis of NCI-BR component weights",
+    "data_status": "Observed environmental inputs only. No hypothetical footprints. No synthetic scenarios.",
+    "n_simulations": N_SIM,
+    "random_seed": RANDOM_SEED,
+    "dirichlet_concentration": DIRICHLET_CONCENTRATION,
+    "baseline_weights": baseline_weights,
+    "components": components,
+    "outputs": {
+        "uncertainty_gpkg": str(output_gpkg),
+        "uncertainty_csv": str(output_csv),
+        "weight_samples": str(weights_csv),
+        "summary": str(summary_csv),
+        "robustness_summary": str(robustness_csv),
+        "component_influence": str(component_corr_csv),
+        "figure_png": str(fig_png),
+        "figure_pdf": str(fig_pdf)
+    },
+    "created_at": datetime.now().isoformat()
+}
+
+metadata_path = DIRS["metadata"] / "nci_br_block15_uncertainty_sensitivity_metadata.json"
+
+with open(metadata_path, "w", encoding="utf-8") as f:
+    json.dump(block15_metadata, f, indent=4, ensure_ascii=False)
+
+print(f"\nMetadata saved at: {metadata_path}")
+
+logger.info("Block 15 completed successfully.")
+
+print("\nBLOCK 15 completed successfully.")
+print("Next step: final scientific synthesis, manuscript-ready results, and updated QA/QC.")
