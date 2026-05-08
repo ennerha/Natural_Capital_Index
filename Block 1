@@ -1,0 +1,215 @@
+# ============================================================
+# BRAZIL NCI-BR PROJECT
+# BLOCK 01 — PROJECT SETUP, DIRECTORIES, LOGGING, GEE INIT
+# ============================================================
+
+import os
+import sys
+import json
+import time
+import logging
+import subprocess
+from pathlib import Path
+from datetime import datetime
+
+# ------------------------------------------------------------
+# 1. Install / check required packages
+# ------------------------------------------------------------
+
+REQUIRED_PACKAGES = [
+    "earthengine-api",
+    "geemap",
+    "geopandas",
+    "pandas",
+    "numpy",
+    "matplotlib",
+    "seaborn",
+    "rasterio",
+    "shapely",
+    "pyproj",
+    "tqdm",
+    "scipy",
+    "statsmodels",
+    "scikit-learn",
+    "mapclassify",
+    "contextily",
+    "cartopy"
+]
+
+def install_if_missing(package):
+    try:
+        __import__(package.replace("-", "_"))
+    except ImportError:
+        print(f"Installing {package}...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", package])
+
+for pkg in REQUIRED_PACKAGES:
+    install_if_missing(pkg)
+
+# ------------------------------------------------------------
+# 2. Imports after installation
+# ------------------------------------------------------------
+
+import ee
+import geemap
+import pandas as pd
+import numpy as np
+import geopandas as gpd
+import matplotlib.pyplot as plt
+
+from tqdm.auto import tqdm
+
+# ------------------------------------------------------------
+# 3. Mount Google Drive
+# ------------------------------------------------------------
+
+try:
+    from google.colab import drive
+    drive.mount("/content/drive")
+    IN_COLAB = True
+except Exception:
+    IN_COLAB = False
+    print("Google Colab not detected. Running locally.")
+
+# ------------------------------------------------------------
+# 4. Project directory structure
+# ------------------------------------------------------------
+
+PROJECT_ROOT = Path("/content/drive/MyDrive/Brazil/NCI_BR_Project")
+
+DIRS = {
+    "root": PROJECT_ROOT,
+    "raw": PROJECT_ROOT / "01_raw",
+    "intermediate": PROJECT_ROOT / "02_intermediate",
+    "processed": PROJECT_ROOT / "03_processed",
+    "tables": PROJECT_ROOT / "04_tables",
+    "figures": PROJECT_ROOT / "05_figures",
+    "maps": PROJECT_ROOT / "06_maps",
+    "exports": PROJECT_ROOT / "07_exports",
+    "logs": PROJECT_ROOT / "08_logs",
+    "metadata": PROJECT_ROOT / "09_metadata"
+}
+
+for d in DIRS.values():
+    d.mkdir(parents=True, exist_ok=True)
+
+print("Project folders created:")
+for key, value in DIRS.items():
+    print(f"  {key}: {value}")
+
+# ------------------------------------------------------------
+# 5. Logging
+# ------------------------------------------------------------
+
+log_file = DIRS["logs"] / f"nci_br_block01_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+logging.basicConfig(
+    filename=log_file,
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+logger = logging.getLogger("NCI_BR")
+
+logger.info("NCI-BR Block 01 started.")
+logger.info(f"Project root: {PROJECT_ROOT}")
+
+print(f"\nLog file created at: {log_file}")
+
+# ------------------------------------------------------------
+# 6. Earth Engine initialization
+# ------------------------------------------------------------
+
+EE_PROJECT_ID = "ee-enneralcantara2"
+
+try:
+    ee.Initialize(project=EE_PROJECT_ID)
+    logger.info("Google Earth Engine initialized without authentication prompt.")
+    print("Google Earth Engine initialized successfully.")
+except Exception as e:
+    logger.warning("Earth Engine initialization failed. Trying authentication.")
+    print("Earth Engine authentication required.")
+    ee.Authenticate()
+    ee.Initialize(project=EE_PROJECT_ID)
+    logger.info("Google Earth Engine initialized after authentication.")
+    print("Google Earth Engine initialized successfully after authentication.")
+
+# ------------------------------------------------------------
+# 7. Global project parameters
+# ------------------------------------------------------------
+
+CONFIG = {
+    "project_name": "Brazil Natural Capital Index",
+    "project_short_name": "NCI-BR",
+    "country": "Brazil",
+    "pilot_region": "São José dos Campos–Jacareí",
+    "expansion_region": "Paraíba Valley, São Paulo State",
+    "analysis_year_start": 1985,
+    "analysis_year_end": 2024,
+    "baseline_year": 2024,
+    "spatial_resolution_m": 30,
+    "gee_project_id": EE_PROJECT_ID,
+    "municipal_asset": "projects/ee-enneralcantara2/assets/BR_Municipios_2022",
+    "mapbiomas_asset": "projects/mapbiomas-public/assets/brazil/lulc/collection10/mapbiomas_brazil_collection10_integration_v2",
+    "output_crs": "EPSG:5880",
+    "figure_dpi": 500,
+    "created_at": datetime.now().isoformat()
+}
+
+config_path = DIRS["metadata"] / "nci_br_config.json"
+
+with open(config_path, "w", encoding="utf-8") as f:
+    json.dump(CONFIG, f, indent=4, ensure_ascii=False)
+
+logger.info("Configuration file saved.")
+print(f"\nConfiguration saved at: {config_path}")
+
+# ------------------------------------------------------------
+# 8. Matplotlib global style for publication-quality figures
+# ------------------------------------------------------------
+
+plt.rcParams.update({
+    "figure.dpi": 150,
+    "savefig.dpi": CONFIG["figure_dpi"],
+    "font.family": "DejaVu Sans",
+    "font.size": 10,
+    "axes.titlesize": 11,
+    "axes.labelsize": 10,
+    "xtick.labelsize": 9,
+    "ytick.labelsize": 9,
+    "legend.fontsize": 9,
+    "axes.linewidth": 0.8,
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+    "savefig.bbox": "tight"
+})
+
+logger.info("Matplotlib style configured.")
+
+# ------------------------------------------------------------
+# 9. Quick Earth Engine test
+# ------------------------------------------------------------
+
+try:
+    test_img = ee.Image("USGS/SRTMGL1_003")
+    test_value = test_img.reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=ee.Geometry.Point([-45.9, -23.2]).buffer(1000),
+        scale=30,
+        maxPixels=1e6
+    ).getInfo()
+
+    logger.info("Earth Engine test completed successfully.")
+    print("\nEarth Engine test completed successfully.")
+    print(test_value)
+
+except Exception as e:
+    logger.error(f"Earth Engine test failed: {e}")
+    raise RuntimeError("Earth Engine test failed. Check authentication/project access.")
+
+# ------------------------------------------------------------
+# 10. Completion message
+# ------------------------------------------------------------
+
+print("\nBLOCK 01 completed successfully.")
+print("Next block: define pilot municipalities, retrieve boundaries, validate geometries, and create the study-area base map.")
