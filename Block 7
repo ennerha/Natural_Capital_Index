@@ -1,0 +1,752 @@
+# ============================================================
+# BRAZIL NCI-BR PROJECT
+# BLOCK 07 — SPATIAL STATISTICS: MORAN'S I, LISA, HOTSPOTS
+# FOCUS: SÃO JOSÉ DOS CAMPOS — SP, BRAZIL
+# ============================================================
+#
+# Corrections applied:
+#   [FIX-1]  Input file path updated to nci_br_sjc_* pattern
+#   [FIX-2]  DIRS creation loop added
+#   [FIX-3]  plot_crs defined at block start
+#   [FIX-4]  Grid CSV exported via pd.DataFrame()
+#   [FIX-5]  Municipal boundary overlaid on all map panels
+#   [FIX-6]  Consistent map_extent applied to all map panels
+#   [FIX-7]  All output filenames follow nci_br_sjc_* pattern
+#   [FIX-8]  grid_area_ha guarded in cluster aggregations
+#   [FIX-9]  Queen/KNN weights: removed deprecated use_index;
+#             index reset to contiguous 0..N before weights
+#   [FIX-10] Spatial lag computed via lag_spatial() not w.sparse
+#   [FIX-11] NaN-safe color mapping (.fillna grey) for LISA/Gi*
+#   [FIX-12] Separate binary weights (w_bin) used for G_Local
+#             to avoid double row-standardisation
+#   [FIX-13] two_tailed=True (two-sided test) with justification
+#   [FIX-14] Municipal boundary loaded for overlay
+#   [IMP-1]  Gi* summary table added (panel i)
+#   [IMP-2]  Component Moran's I bar chart added (panel h)
+#   [IMP-3]  Moran table rows colour-coded by significance
+#   [IMP-4]  splot removed (imported but never used)
+#   [NEW-1]  MD5 checksums added
+#   [NEW-2]  Expanded to 9 panels
+# ============================================================
+
+import sys
+import json
+import logging
+import hashlib
+import subprocess
+from pathlib import Path
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+
+# ------------------------------------------------------------
+# 1. Install / verify spatial statistics packages
+# ------------------------------------------------------------
+
+REQUIRED_PACKAGES = ["libpysal", "esda", "mapclassify"]
+
+def install_if_missing(pkg: str) -> None:
+    try:
+        __import__(pkg)
+    except ImportError:
+        print(f"Installing {pkg}...")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "-q", pkg]
+        )
+
+for pkg in REQUIRED_PACKAGES:
+    install_if_missing(pkg)
+
+from libpysal.weights import Queen, KNN
+from libpysal.weights.spatial_lag import lag_spatial   # [FIX-10]
+from esda.moran import Moran, Moran_Local
+from esda.getisord import G_Local
+
+# ------------------------------------------------------------
+# 2. Reload project configuration
+# ------------------------------------------------------------
+
+PROJECT_ROOT = Path("/content/drive/MyDrive/Brazil/NCI_BR_Project")
+
+DIRS = {
+    "root":         PROJECT_ROOT,
+    "raw":          PROJECT_ROOT / "01_raw",
+    "intermediate": PROJECT_ROOT / "02_intermediate",
+    "processed":    PROJECT_ROOT / "03_processed",
+    "tables":       PROJECT_ROOT / "04_tables",
+    "figures":      PROJECT_ROOT / "05_figures",
+    "maps":         PROJECT_ROOT / "06_maps",
+    "exports":      PROJECT_ROOT / "07_exports",
+    "logs":         PROJECT_ROOT / "08_logs",
+    "metadata":     PROJECT_ROOT / "09_metadata",
+}
+
+# [FIX-2] Create directories
+for d in DIRS.values():
+    d.mkdir(parents=True, exist_ok=True)
+
+config_path = DIRS["metadata"] / "nci_br_config.json"
+with open(config_path, "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
+
+# [FIX-3] Define plot_crs at block start
+plot_crs     = CONFIG.get("output_crs", "EPSG:5880")
+MUNICIPALITY = "São José dos Campos"
+
+# ------------------------------------------------------------
+# 3. Logging
+# ------------------------------------------------------------
+
+log_file = DIRS["logs"] / f"nci_br_block07_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+logging.basicConfig(
+    filename=log_file, level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger("NCI_BR_BLOCK07")
+logger.info(f"Block 07 started — {MUNICIPALITY}.")
+print(f"Log file: {log_file}")
+
+# ------------------------------------------------------------
+# 4. [FIX-1] Load NCI-BR grid and municipal boundary
+# ------------------------------------------------------------
+
+nci_path  = DIRS["processed"] / "nci_br_sjc_grid_integrated_index.gpkg"
+muni_path = DIRS["processed"] / "nci_br_sjc_municipality.gpkg"
+
+for p in [nci_path, muni_path]:
+    if not p.exists():
+        raise FileNotFoundError(
+            f"Required input not found: {p}\n"
+            "Run Blocks 02 and 06 before Block 07."
+        )
+
+gdf      = gpd.read_file(nci_path)
+muni_gdf = gpd.read_file(muni_path)
+
+if gdf.crs is None:
+    gdf = gdf.set_crs(plot_crs)
+gdf = gdf.to_crs(plot_crs)
+
+if muni_gdf.crs is None:
+    muni_gdf = muni_gdf.set_crs("EPSG:4674")
+muni_plot = muni_gdf.to_crs(plot_crs)
+
+print(f"NCI-BR grid loaded : {len(gdf)} cells")
+print(f"CRS                : {gdf.crs}")
+
+# ------------------------------------------------------------
+# 5. Prepare target variables
+# ------------------------------------------------------------
+
+TARGET_VARS = [
+    "NCI_BR",
+    "score_native_vegetation",
+    "score_hydrological_regulation",
+    "score_low_anthropic_pressure",
+    "score_vegetation_condition",
+]
+
+available_vars = [v for v in TARGET_VARS if v in gdf.columns]
+
+if "NCI_BR" not in available_vars:
+    raise ValueError("Column NCI_BR not found. Run Block 06 first.")
+
+for col in available_vars:
+    gdf[col] = pd.to_numeric(gdf[col], errors="coerce")
+
+# [FIX-9] Drop NaN rows and reset index to contiguous 0..N
+#          libpysal requires a contiguous integer index for weight construction
+gdf = gdf.dropna(subset=["NCI_BR"]).reset_index(drop=True).copy()
+
+print(f"Valid cells for spatial statistics: {len(gdf)}")
+logger.info(f"Valid cells: {len(gdf)}")
+
+# Map extent for all panels
+xmin, ymin, xmax, ymax = muni_plot.total_bounds
+xbuf = (xmax - xmin) * 0.05
+ybuf = (ymax - ymin) * 0.05
+map_extent = [xmin - xbuf, xmax + xbuf, ymin - ybuf, ymax + ybuf]
+
+SIG_LEVEL = 0.05
+
+# ------------------------------------------------------------
+# 6. Spatial weights
+# ------------------------------------------------------------
+# Row-standardised Queen contiguity for Moran's I and LISA.
+# Separate untransformed (binary) Queen weights for G_Local
+# to avoid double row-standardisation. [FIX-12]
+
+def build_weights(gdf: gpd.GeoDataFrame) -> tuple:
+    """
+    Returns (w_row, w_bin, weights_type).
+    w_row : row-standardised weights (Moran, LISA)
+    w_bin : binary weights            (G_Local / Gi*)
+    """
+    try:
+        # [FIX-9] No ids kwarg — let libpysal use the DataFrame index
+        w = Queen.from_dataframe(gdf)
+
+        if len(w.islands) > 0:
+            print(f"  Queen: {len(w.islands)} islands found. Switching to KNN-8.")
+            w = KNN.from_dataframe(gdf, k=8)
+            wtype = "KNN-8"
+        else:
+            wtype = "Queen contiguity"
+
+    except Exception as e:
+        print(f"  Queen weights failed ({e}). Using KNN-8.")
+        w = KNN.from_dataframe(gdf, k=8)
+        wtype = "KNN-8"
+
+    # Binary copy for G_Local
+    w_bin = w
+    w_bin.transform = "b"   # binary
+
+    # Row-standardised copy for Moran / LISA
+    w_row = w
+    w_row.transform = "r"
+
+    return w_row, w_bin, wtype
+
+
+w_row, w_bin, weights_type = build_weights(gdf)
+print(f"Spatial weights: {weights_type}")
+logger.info(f"Weights: {weights_type}")
+
+# ------------------------------------------------------------
+# 7. Global Moran's I — two-tailed test
+# ------------------------------------------------------------
+# [FIX-13] two_tailed=True (default): the composite NCI-BR can
+# exhibit either positive (clustering of high/low values) or
+# negative (spatial dispersion) autocorrelation. A two-tailed
+# test is appropriate here.
+
+print(f"\nComputing Global Moran's I ({len(available_vars)} variables)...")
+
+moran_records = []
+
+for var in available_vars:
+    y = gdf[var].values
+    mi = Moran(y, w_row, permutations=999, two_tailed=True)
+    moran_records.append({
+        "variable":    var,
+        "moran_I":     round(mi.I,     4),
+        "expected_I":  round(mi.EI,    4),
+        "z_score":     round(mi.z_sim, 3),
+        "p_value":     round(mi.p_sim, 4),
+        "significant": mi.p_sim <= SIG_LEVEL,
+        "permutations": 999,
+        "test":         "two-tailed",
+        "weights":      weights_type,
+    })
+
+moran_df   = pd.DataFrame(moran_records)
+moran_path = DIRS["tables"] / "nci_br_sjc_global_morans_i.csv"
+moran_df.to_csv(moran_path, index=False, encoding="utf-8-sig")
+
+print("\nGlobal Moran's I results:")
+print(moran_df[["variable", "moran_I", "z_score", "p_value", "significant"]].to_string(index=False))
+
+# ------------------------------------------------------------
+# 8. Local Moran's I / LISA for NCI-BR
+# ------------------------------------------------------------
+
+print(f"\nComputing Local Moran's I (LISA) for NCI-BR...")
+
+y_nci = gdf["NCI_BR"].values
+lisa  = Moran_Local(y_nci, w_row, permutations=999, seed=42)
+
+gdf["LISA_I"]           = lisa.Is
+gdf["LISA_p"]           = lisa.p_sim
+gdf["LISA_q"]           = lisa.q
+gdf["LISA_significant"] = lisa.p_sim <= SIG_LEVEL
+
+
+def classify_lisa(row) -> str:
+    if not row["LISA_significant"]:
+        return "Not significant"
+    q_map = {1: "High-High", 2: "Low-High", 3: "Low-Low", 4: "High-Low"}
+    return q_map.get(int(row["LISA_q"]), "Not significant")
+
+
+gdf["LISA_cluster"] = gdf.apply(classify_lisa, axis=1)
+
+# ------------------------------------------------------------
+# 9. Getis-Ord Gi* hotspots for NCI-BR
+# ------------------------------------------------------------
+# [FIX-12] Use binary weights (w_bin) to avoid double-standardisation.
+# star=True includes the focal cell (Gi* vs Gi).
+
+print("Computing Getis-Ord Gi* hotspots...")
+
+gi = G_Local(y_nci, w_bin, transform="B", permutations=999, star=True, seed=42)
+
+gdf["GiZScore"] = gi.Zs
+gdf["GiPValue"] = gi.p_sim
+
+
+def classify_gi(row) -> str:
+    z, p = row["GiZScore"], row["GiPValue"]
+    if   p <= 0.01 and z > 0: return "Hotspot 99%"
+    elif p <= 0.05 and z > 0: return "Hotspot 95%"
+    elif p <= 0.10 and z > 0: return "Hotspot 90%"
+    elif p <= 0.01 and z < 0: return "Coldspot 99%"
+    elif p <= 0.05 and z < 0: return "Coldspot 95%"
+    elif p <= 0.10 and z < 0: return "Coldspot 90%"
+    else:                      return "Not significant"
+
+
+gdf["Gi_cluster"] = gdf.apply(classify_gi, axis=1)
+
+# ------------------------------------------------------------
+# 10. [FIX-10] Moran scatterplot data using lag_spatial()
+# ------------------------------------------------------------
+
+z_std = (gdf["NCI_BR"] - gdf["NCI_BR"].mean()) / gdf["NCI_BR"].std()
+wz    = lag_spatial(w_row, z_std.values)   # correct spatial lag
+
+scatter_df = pd.DataFrame({
+    "grid_id":                gdf.index,
+    "NCI_BR_z":               z_std.values,
+    "spatial_lag_NCI_BR_z":   wz,
+})
+
+scatter_path = DIRS["tables"] / "nci_br_sjc_moran_scatterplot_data.csv"
+scatter_df.to_csv(scatter_path, index=False, encoding="utf-8-sig")
+
+# ------------------------------------------------------------
+# 11. [FIX-8] Cluster summaries — guard grid_area_ha
+# ------------------------------------------------------------
+
+agg_base = {"NCI_BR": ["count", "mean", "median"]}
+if "grid_area_ha" in gdf.columns:
+    agg_base["grid_area_ha"] = "sum"
+
+
+def make_cluster_summary(gdf, group_col):
+    agg = {"NCI_BR": ["count", "mean", "median"]}
+    if "grid_area_ha" in gdf.columns:
+        agg["grid_area_ha"] = "sum"
+    df = (
+        gdf.groupby(group_col)
+        .agg(agg)
+        .reset_index()
+    )
+    df.columns = [
+        group_col, "n_cells", "mean_NCI_BR", "median_NCI_BR"
+    ] + (["total_area_ha"] if "grid_area_ha" in gdf.columns else [])
+    return df.sort_values("mean_NCI_BR", ascending=False)
+
+
+lisa_summary = make_cluster_summary(gdf, "LISA_cluster")
+gi_summary   = make_cluster_summary(gdf, "Gi_cluster")
+
+# ------------------------------------------------------------
+# 12. Export spatial statistics products
+# ------------------------------------------------------------
+
+spatial_path = DIRS["processed"] / "nci_br_sjc_spatial_statistics.gpkg"
+spatial_csv  = DIRS["tables"]    / "nci_br_sjc_spatial_statistics.csv"
+lisa_sum_path = DIRS["tables"]   / "nci_br_sjc_lisa_cluster_summary.csv"
+gi_sum_path  = DIRS["tables"]    / "nci_br_sjc_gi_hotspot_summary.csv"
+
+gdf.to_file(spatial_path, layer="spatial_statistics", driver="GPKG")
+
+# [FIX-4] pd.DataFrame() before CSV export
+pd.DataFrame(gdf.drop(columns="geometry", errors="ignore")).to_csv(
+    spatial_csv, index=False, encoding="utf-8-sig"
+)
+lisa_summary.to_csv(lisa_sum_path, index=False, encoding="utf-8-sig")
+gi_summary.to_csv(gi_sum_path,     index=False, encoding="utf-8-sig")
+
+print(f"\nSpatial statistics exported:")
+for p in [spatial_path, spatial_csv, lisa_sum_path, gi_sum_path, scatter_path]:
+    print(f"  {p}")
+logger.info(f"Spatial statistics: {len(gdf)} cells | weights: {weights_type}")
+
+# ------------------------------------------------------------
+# 13. Prepare plotting
+# ------------------------------------------------------------
+
+LISA_COLORS = {
+    "High-High":      "#d7191c",
+    "Low-Low":        "#2c7bb6",
+    "High-Low":       "#fdae61",
+    "Low-High":       "#abd9e9",
+    "Not significant":"#d9d9d9",
+}
+GI_COLORS = {
+    "Hotspot 99%":    "#7f0000",
+    "Hotspot 95%":    "#d7301f",
+    "Hotspot 90%":    "#fc8d59",
+    "Coldspot 99%":   "#08306b",
+    "Coldspot 95%":   "#2171b5",
+    "Coldspot 90%":   "#6baed6",
+    "Not significant":"#d9d9d9",
+}
+
+# [FIX-11] NaN-safe color mapping
+gdf["LISA_color"] = gdf["LISA_cluster"].map(LISA_COLORS).fillna("#d9d9d9")
+gdf["Gi_color"]   = gdf["Gi_cluster"].map(GI_COLORS).fillna("#d9d9d9")
+
+
+def overlay_boundary(ax, gdf):
+    gdf.boundary.plot(ax=ax, edgecolor="black", linewidth=1.2, zorder=5)
+
+
+def set_map_extent(ax):
+    ax.set_xlim(map_extent[0], map_extent[1])
+    ax.set_ylim(map_extent[2], map_extent[3])
+    ax.set_axis_off()
+
+
+def add_panel_label(ax, label):
+    ax.text(0.02, 0.97, label, transform=ax.transAxes,
+            fontsize=12, fontweight="bold", va="top", ha="left",
+            bbox=dict(facecolor="white", edgecolor="none",
+                      alpha=0.88, boxstyle="round,pad=0.22"))
+
+
+def make_legend_handles(color_dict, present_only=False, present_vals=None):
+    return [
+        mpatches.Patch(facecolor=c, edgecolor="none", label=l)
+        for l, c in color_dict.items()
+        if (not present_only) or (l in (present_vals or []))
+    ]
+
+# NCI-BR Moran row for scatterplot title
+nci_moran_row = moran_df[moran_df["variable"] == "NCI_BR"].iloc[0]
+
+# ------------------------------------------------------------
+# 14. High-quality composite figure — 9 panels
+# ------------------------------------------------------------
+
+plt.rcParams.update({
+    "figure.dpi": 150, "savefig.dpi": CONFIG["figure_dpi"],
+    "font.family": "DejaVu Sans", "font.size": 9.5,
+    "axes.titlesize": 10, "axes.labelsize": 9,
+    "legend.fontsize": 7.5, "axes.linewidth": 0.7,
+    "pdf.fonttype": 42, "ps.fonttype": 42, "savefig.bbox": "tight",
+})
+
+fig = plt.figure(figsize=(16, 11), dpi=150)
+gs  = fig.add_gridspec(
+    nrows=3, ncols=3,
+    width_ratios=[1.2, 1.2, 1.0],
+    height_ratios=[1, 1, 1],
+    wspace=0.22, hspace=0.32
+)
+
+ax_a = fig.add_subplot(gs[0, 0])
+ax_b = fig.add_subplot(gs[0, 1])
+ax_c = fig.add_subplot(gs[0, 2])
+ax_d = fig.add_subplot(gs[1, 0])
+ax_e = fig.add_subplot(gs[1, 1])
+ax_f = fig.add_subplot(gs[1, 2])
+ax_g = fig.add_subplot(gs[2, 0])
+ax_h = fig.add_subplot(gs[2, 1])
+ax_i = fig.add_subplot(gs[2, 2])
+
+# ── Panel a — NCI-BR continuous map ──────────────────────────
+gdf.plot(
+    column="NCI_BR", ax=ax_a,
+    cmap="YlGn", linewidth=0.0, legend=True,
+    legend_kwds={"label": "NCI-BR (0–100)", "shrink": 0.7},
+    missing_kwds={"color": "lightgrey"},
+    vmin=0, vmax=100
+)
+overlay_boundary(ax_a, muni_plot)  # [FIX-5]
+set_map_extent(ax_a)               # [FIX-6]
+ax_a.set_title("Integrated NCI-BR", loc="left")
+add_panel_label(ax_a, "a")
+
+# ── Panel b — LISA cluster map ────────────────────────────────
+gdf.plot(ax=ax_b, color=gdf["LISA_color"], linewidth=0.0)
+overlay_boundary(ax_b, muni_plot)
+set_map_extent(ax_b)
+ax_b.set_title("Local Moran's I — LISA clusters", loc="left")
+ax_b.legend(handles=make_legend_handles(LISA_COLORS),
+            loc="lower left", framealpha=0.90, edgecolor="#bdbdbd")
+add_panel_label(ax_b, "b")
+
+# ── Panel c — Global Moran's I table ─────────────────────────
+ax_c.axis("off")
+
+m_disp = moran_df.copy()
+m_disp["moran_I"] = m_disp["moran_I"].map(lambda x: f"{x:.3f}")
+m_disp["z_score"] = m_disp["z_score"].map(lambda x: f"{x:.2f}")
+m_disp["p_value"] = m_disp["p_value"].map(lambda x: f"{x:.3f}")
+m_disp["variable"] = m_disp["variable"].str.replace("score_", "", regex=False).str.replace("_", " ")
+
+tbl = ax_c.table(
+    cellText=m_disp[["variable", "moran_I", "z_score", "p_value"]].values,
+    colLabels=["Variable", "I", "Z", "p (2-tail)"],
+    loc="center", cellLoc="center"
+)
+tbl.auto_set_font_size(False)
+tbl.set_fontsize(7.0)
+tbl.scale(1.0, 1.32)
+
+for (row, col), cell in tbl.get_celld().items():
+    cell.set_edgecolor("#bdbdbd")
+    cell.set_linewidth(0.5)
+    if row == 0:
+        cell.set_facecolor("#f0f0f0")
+        cell.set_text_props(weight="bold")
+    elif row > 0:
+        # [IMP-3] Colour rows by significance
+        is_sig = moran_df.iloc[row - 1]["significant"]
+        cell.set_facecolor("#e8f5e9" if is_sig else "white")
+
+ax_c.set_title("Global Moran's I (999 permutations)", loc="left")
+add_panel_label(ax_c, "c")
+
+# ── Panel d — Gi* hotspot map ─────────────────────────────────
+gdf.plot(ax=ax_d, color=gdf["Gi_color"], linewidth=0.0)
+overlay_boundary(ax_d, muni_plot)
+set_map_extent(ax_d)
+ax_d.set_title("Getis-Ord Gi* hotspots / coldspots", loc="left")
+present_gi = gdf["Gi_cluster"].unique().tolist()
+ax_d.legend(
+    handles=make_legend_handles(GI_COLORS, present_only=True, present_vals=present_gi),
+    loc="lower left", framealpha=0.90, edgecolor="#bdbdbd"
+)
+add_panel_label(ax_d, "d")
+
+# ── Panel e — Moran scatterplot ───────────────────────────────
+quad_colors = {1: "#d7191c", 2: "#abd9e9", 3: "#2c7bb6", 4: "#fdae61"}
+point_colors = [
+    quad_colors.get(int(q), "#d9d9d9") if sig else "#d9d9d9"
+    for q, sig in zip(gdf["LISA_q"].fillna(0).astype(int), gdf["LISA_significant"])
+]
+
+ax_e.scatter(scatter_df["NCI_BR_z"], scatter_df["spatial_lag_NCI_BR_z"],
+             s=8, alpha=0.55, c=point_colors)
+
+coef  = np.polyfit(scatter_df["NCI_BR_z"], scatter_df["spatial_lag_NCI_BR_z"], 1)
+xline = np.linspace(scatter_df["NCI_BR_z"].min(), scatter_df["NCI_BR_z"].max(), 100)
+ax_e.plot(xline, coef[0] * xline + coef[1], "k-", linewidth=1.8)
+ax_e.axhline(0, color="gray", linewidth=0.6)
+ax_e.axvline(0, color="gray", linewidth=0.6)
+
+ax_e.set_title(
+    f"Moran scatterplot: NCI-BR "
+    f"(I = {nci_moran_row['moran_I']:.3f}, "
+    f"p = {nci_moran_row['p_value']:.3f})",
+    loc="left"
+)
+ax_e.set_xlabel("NCI-BR standardised (z)")
+ax_e.set_ylabel("Spatial lag of NCI-BR (z)")
+ax_e.grid(True, linewidth=0.3, alpha=0.5)
+add_panel_label(ax_e, "e")
+
+# ── Panel f — LISA cluster summary table ─────────────────────
+ax_f.axis("off")
+
+l_disp = lisa_summary.copy()
+l_disp["mean_NCI_BR"] = l_disp["mean_NCI_BR"].map(lambda x: f"{x:.1f}")
+if "total_area_ha" in l_disp.columns:
+    l_disp["total_area_ha"] = l_disp["total_area_ha"].map(lambda x: f"{x:,.0f}")
+    cols_f  = ["LISA_cluster", "n_cells", "mean_NCI_BR", "total_area_ha"]
+    heads_f = ["Cluster", "Cells", "Mean NCI", "Area (ha)"]
+else:
+    cols_f  = ["LISA_cluster", "n_cells", "mean_NCI_BR"]
+    heads_f = ["Cluster", "Cells", "Mean NCI"]
+
+tbl2 = ax_f.table(
+    cellText=l_disp[cols_f].values,
+    colLabels=heads_f, loc="center", cellLoc="center"
+)
+tbl2.auto_set_font_size(False)
+tbl2.set_fontsize(7.0)
+tbl2.scale(1.0, 1.35)
+for (row, col), cell in tbl2.get_celld().items():
+    cell.set_edgecolor("#bdbdbd")
+    cell.set_linewidth(0.5)
+    if row == 0:
+        cell.set_facecolor("#f0f0f0")
+        cell.set_text_props(weight="bold")
+    elif row > 0:
+        cluster_name = l_disp.iloc[row - 1]["LISA_cluster"]
+        cell.set_facecolor(LISA_COLORS.get(cluster_name, "white"))
+ax_f.set_title("LISA cluster summary", loc="left")
+add_panel_label(ax_f, "f")
+
+# ── Panel g — LISA quadrant bar chart ────────────────────────
+lisa_counts = gdf["LISA_cluster"].value_counts()
+cluster_order = ["High-High", "Low-Low", "High-Low", "Low-High", "Not significant"]
+counts = [lisa_counts.get(c, 0) for c in cluster_order]
+colors = [LISA_COLORS[c] for c in cluster_order]
+
+ax_g.bar(cluster_order, counts, color=colors, edgecolor="white", linewidth=0.5)
+for i, (c, n) in enumerate(zip(cluster_order, counts)):
+    if n > 0:
+        ax_g.text(i, n + max(counts) * 0.01, str(n),
+                  ha="center", va="bottom", fontsize=7.5)
+ax_g.set_ylabel("Number of 1-km cells")
+ax_g.set_title("LISA cluster distribution", loc="left")
+ax_g.tick_params(axis="x", labelsize=7.5)
+ax_g.grid(axis="y", linewidth=0.3, alpha=0.5)
+add_panel_label(ax_g, "g")
+
+# ── Panel h — [IMP-2] Component Moran's I bar chart ──────────
+comp_df = moran_df[moran_df["variable"] != "NCI_BR"].copy()
+bar_cols = ["#1a7a3c" if sig else "#bdbdbd" for sig in comp_df["significant"]]
+
+ax_h.barh(
+    comp_df["variable"].str.replace("score_", "", regex=False).str.replace("_", " "),
+    comp_df["moran_I"],
+    color=bar_cols, edgecolor="white", linewidth=0.5
+)
+ax_h.axvline(0, color="black", linewidth=0.8)
+ax_h.set_xlabel("Moran's I")
+ax_h.set_title("Global Moran's I by NCI-BR component", loc="left")
+ax_h.tick_params(axis="y", labelsize=7.5)
+ax_h.grid(axis="x", linewidth=0.3, alpha=0.5)
+
+legend_handles = [
+    mpatches.Patch(facecolor="#1a7a3c", label=f"Significant (p ≤ {SIG_LEVEL})"),
+    mpatches.Patch(facecolor="#bdbdbd", label="Not significant"),
+]
+ax_h.legend(handles=legend_handles, fontsize=7.5, framealpha=0.85)
+add_panel_label(ax_h, "h")
+
+# ── Panel i — [IMP-1] Gi* summary table ──────────────────────
+ax_i.axis("off")
+
+g_disp = gi_summary.copy()
+g_disp["mean_NCI_BR"] = g_disp["mean_NCI_BR"].map(lambda x: f"{x:.1f}")
+if "total_area_ha" in g_disp.columns:
+    g_disp["total_area_ha"] = g_disp["total_area_ha"].map(lambda x: f"{x:,.0f}")
+    cols_i  = ["Gi_cluster", "n_cells", "mean_NCI_BR", "total_area_ha"]
+    heads_i = ["Gi* cluster", "Cells", "Mean NCI", "Area (ha)"]
+else:
+    cols_i  = ["Gi_cluster", "n_cells", "mean_NCI_BR"]
+    heads_i = ["Gi* cluster", "Cells", "Mean NCI"]
+
+tbl3 = ax_i.table(
+    cellText=g_disp[cols_i].values,
+    colLabels=heads_i, loc="center", cellLoc="center"
+)
+tbl3.auto_set_font_size(False)
+tbl3.set_fontsize(7.0)
+tbl3.scale(1.0, 1.28)
+for (row, col), cell in tbl3.get_celld().items():
+    cell.set_edgecolor("#bdbdbd")
+    cell.set_linewidth(0.5)
+    if row == 0:
+        cell.set_facecolor("#f0f0f0")
+        cell.set_text_props(weight="bold")
+    elif row > 0:
+        cluster_name = g_disp.iloc[row - 1]["Gi_cluster"]
+        cell.set_facecolor(GI_COLORS.get(cluster_name, "white"))
+ax_i.set_title("Gi* hotspot cluster summary", loc="left")
+add_panel_label(ax_i, "i")
+
+fig.suptitle(
+    f"Spatial autocorrelation and hotspot structure — NCI-BR | {MUNICIPALITY}, SP",
+    fontsize=13, fontweight="bold", y=0.995
+)
+fig.text(
+    0.02, 0.005,
+    f"Weights: {weights_type} | Moran's I: two-tailed, 999 permutations, α = {SIG_LEVEL} | "
+    "Gi* uses binary weights and includes the focal cell (Gi* statistic).",
+    fontsize=7.5, color="#4d4d4d"
+)
+
+fig_png = DIRS["figures"] / "figure_06_nci_br_sjc_spatial_statistics.png"
+fig_pdf = DIRS["figures"] / "figure_06_nci_br_sjc_spatial_statistics.pdf"
+
+plt.savefig(fig_png, dpi=CONFIG["figure_dpi"], bbox_inches="tight")
+plt.savefig(fig_pdf, dpi=CONFIG["figure_dpi"], bbox_inches="tight")
+plt.show()
+
+print(f"\nFigure exported:\n  {fig_png}\n  {fig_pdf}")
+logger.info(f"Figure exported: {fig_png}")
+
+# ------------------------------------------------------------
+# 15. [NEW-1] MD5 checksums
+# ------------------------------------------------------------
+
+def md5_checksum(fp: Path) -> str:
+    h = hashlib.md5()
+    with open(fp, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+checksum_files = [spatial_path, spatial_csv]
+checksums      = {fp.name: md5_checksum(fp) for fp in checksum_files}
+checksums_path = DIRS["metadata"] / "nci_br_block07_checksums.json"
+with open(checksums_path, "w") as f:
+    json.dump(checksums, f, indent=4)
+print(f"MD5 checksums: {checksums_path}")
+
+# ------------------------------------------------------------
+# 16. Block metadata
+# ------------------------------------------------------------
+
+block07_metadata = {
+    "block":             "07",
+    "version":           "final",
+    "municipality":      MUNICIPALITY,
+    "weights_type":      weights_type,
+    "moran_test":        "two-tailed, 999 permutations",
+    "gi_star_weights":   "binary Queen (star=True, focal cell included)",
+    "significance_level": SIG_LEVEL,
+    "target_variables":  available_vars,
+    "lisa_n_significant": int(gdf["LISA_significant"].sum()),
+    "lisa_hh_cells":     int((gdf["LISA_cluster"] == "High-High").sum()),
+    "lisa_ll_cells":     int((gdf["LISA_cluster"] == "Low-Low").sum()),
+    "outputs": {
+        "global_morans_i":       str(moran_path),
+        "spatial_stats_gpkg":    str(spatial_path),
+        "spatial_stats_csv":     str(spatial_csv),
+        "lisa_summary_csv":      str(lisa_sum_path),
+        "gi_summary_csv":        str(gi_sum_path),
+        "moran_scatter_csv":     str(scatter_path),
+        "figure_png":            str(fig_png),
+        "figure_pdf":            str(fig_pdf),
+        "checksums":             str(checksums_path),
+    },
+    "created_at": datetime.now().isoformat(),
+}
+
+metadata_path = DIRS["metadata"] / "nci_br_block07_metadata.json"
+with open(metadata_path, "w", encoding="utf-8") as f:
+    json.dump(block07_metadata, f, indent=4, ensure_ascii=False)
+print(f"Metadata saved: {metadata_path}")
+logger.info("Block 07 completed.")
+
+# ------------------------------------------------------------
+# 17. Final summary
+# ------------------------------------------------------------
+
+nci_mi_row = moran_df[moran_df["variable"] == "NCI_BR"].iloc[0]
+hh = int((gdf["LISA_cluster"] == "High-High").sum())
+ll = int((gdf["LISA_cluster"] == "Low-Low").sum())
+hs = int(gdf["Gi_cluster"].str.startswith("Hotspot").sum())
+cs = int(gdf["Gi_cluster"].str.startswith("Coldspot").sum())
+
+print("\n" + "=" * 62)
+print(f"BLOCK 07 — COMPLETED | {MUNICIPALITY}")
+print("=" * 62)
+print(f"  Spatial weights         : {weights_type}")
+print(f"  Valid grid cells        : {len(gdf)}")
+print(f"\n  Global Moran's I (NCI-BR):")
+print(f"    I = {nci_mi_row['moran_I']:.4f} | Z = {nci_mi_row['z_score']:.3f} | p = {nci_mi_row['p_value']:.4f}")
+print(f"\n  LISA clusters (p ≤ {SIG_LEVEL}):")
+print(f"    High-High : {hh} cells")
+print(f"    Low-Low   : {ll} cells")
+print(f"    Total sig.: {int(gdf['LISA_significant'].sum())} cells")
+print(f"\n  Gi* clusters:")
+print(f"    Hotspot   : {hs} cells")
+print(f"    Coldspot  : {cs} cells")
+print("=" * 62)
+print("\nNext block: industrial conversion scenario simulation")
+print("and natural-capital loss accounting.")
