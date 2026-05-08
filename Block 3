@@ -1,0 +1,683 @@
+# ============================================================
+# BRAZIL NCI-BR PROJECT
+# BLOCK 03 — MAPBIOMAS LAND-COVER TRAJECTORIES, 1985–2024
+# FOCUS: SÃO JOSÉ DOS CAMPOS — SP, BRAZIL
+# ============================================================
+
+import json
+import logging
+import hashlib
+from pathlib import Path
+from datetime import datetime
+
+import ee
+import geemap
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.colors import TwoSlopeNorm
+
+# ------------------------------------------------------------
+# 1. Reload project configuration
+# ------------------------------------------------------------
+
+PROJECT_ROOT = Path("/content/drive/MyDrive/Brazil/NCI_BR_Project")
+
+DIRS = {
+    "root":         PROJECT_ROOT,
+    "raw":          PROJECT_ROOT / "01_raw",
+    "intermediate": PROJECT_ROOT / "02_intermediate",
+    "processed":    PROJECT_ROOT / "03_processed",
+    "tables":       PROJECT_ROOT / "04_tables",
+    "figures":      PROJECT_ROOT / "05_figures",
+    "maps":         PROJECT_ROOT / "06_maps",
+    "exports":      PROJECT_ROOT / "07_exports",
+    "logs":         PROJECT_ROOT / "08_logs",
+    "metadata":     PROJECT_ROOT / "09_metadata",
+}
+for d in DIRS.values():
+    d.mkdir(parents=True, exist_ok=True)
+
+config_path = DIRS["metadata"] / "nci_br_config.json"
+with open(config_path, "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
+
+MUNICIPALITY  = "São José dos Campos"
+plot_crs      = CONFIG.get("output_crs", "EPSG:5880")
+START_YEAR    = int(CONFIG["analysis_year_start"])
+END_YEAR      = int(CONFIG["analysis_year_end"])
+BASELINE_YEAR = int(CONFIG["baseline_year"])
+YEARS         = list(range(START_YEAR, END_YEAR + 1))
+
+# ------------------------------------------------------------
+# 2. Logging
+# ------------------------------------------------------------
+
+log_file = DIRS["logs"] / f"nci_br_block03_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+logging.basicConfig(
+    filename=log_file, level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger("NCI_BR_BLOCK03")
+logger.info(f"Block 03 started — {MUNICIPALITY}.")
+print(f"Log file: {log_file}")
+
+# ------------------------------------------------------------
+# 3. Earth Engine initialization
+# ------------------------------------------------------------
+
+try:
+    ee.Initialize(project=CONFIG["gee_project_id"])
+    print("Google Earth Engine initialized.")
+except Exception:
+    ee.Authenticate()
+    ee.Initialize(project=CONFIG["gee_project_id"])
+    print("Google Earth Engine initialized after authentication.")
+
+# ------------------------------------------------------------
+# 4. Load municipality and grid from Block 02
+# ------------------------------------------------------------
+
+muni_path = DIRS["processed"] / "nci_br_sjc_municipality.gpkg"
+grid_path = DIRS["processed"] / "nci_br_sjc_grid_1km.gpkg"
+
+muni_gdf = gpd.read_file(muni_path)
+grid_gdf = gpd.read_file(grid_path)
+
+if muni_gdf.crs is None:
+    muni_gdf = muni_gdf.set_crs("EPSG:4674")
+if grid_gdf.crs is None:
+    grid_gdf = grid_gdf.set_crs(plot_crs)
+
+muni_ee  = geemap.geopandas_to_ee(muni_gdf.to_crs("EPSG:4326"))
+grid_ee  = geemap.geopandas_to_ee(grid_gdf.to_crs("EPSG:4326"))
+aoi_geom = muni_ee.geometry()
+
+print(f"Municipality loaded : {MUNICIPALITY}")
+print(f"Grid loaded         : {len(grid_gdf)} cells")
+
+# ------------------------------------------------------------
+# 5. Load MapBiomas Collection 10
+# ------------------------------------------------------------
+
+mapbiomas_raw = ee.Image(CONFIG["mapbiomas_asset"])
+print(f"MapBiomas Collection 10: {START_YEAR}–{END_YEAR}")
+
+# ------------------------------------------------------------
+# 6. Land-cover class groups
+# ------------------------------------------------------------
+# Class 30 (mining) appears only in the 'mining' group.
+# bare_nonvegetated excludes class 30 to avoid double-counting.
+
+CLASS_GROUPS = {
+    "native_vegetation":   [3, 4, 5, 6, 11, 12, 32, 49, 50],
+    "forest":              [3],
+    "savanna_grassland":   [4, 5, 6, 11, 12, 32, 49, 50],
+    "agriculture_pasture": [15, 18, 19, 20, 39, 40, 41, 46, 47, 48],
+    "urban":               [24],
+    "water":               [33],
+    "mining":              [30],
+    "mosaic_anthropic":    [21],
+    "bare_nonvegetated":   [22, 25, 29, 31],
+}
+
+# Combined anthropogenic pressure (deduplicated)
+CLASS_GROUPS["anthropic"] = sorted(list(set(
+    CLASS_GROUPS["agriculture_pasture"]
+    + CLASS_GROUPS["urban"]
+    + CLASS_GROUPS["mining"]
+    + CLASS_GROUPS["mosaic_anthropic"]
+    + CLASS_GROUPS["bare_nonvegetated"]
+)))
+
+# ------------------------------------------------------------
+# 7. Helper functions (redefined inline — no cross-block imports)
+# ------------------------------------------------------------
+
+def clip_image_to_aoi(image: ee.Image, aoi_geometry: ee.Geometry) -> ee.Image:
+    """Clip and mask an ee.Image to the exact municipal boundary."""
+    return (
+        image
+        .clip(aoi_geometry)
+        .updateMask(ee.Image.constant(1).clip(aoi_geometry).unmask(0))
+    )
+
+
+def build_multiband_area_image(lulc_img: ee.Image) -> ee.Image:
+    """
+    Build a multiband image where each band holds the area (ha) of
+    one class group. Allows computing all groups in a single
+    reduceRegion call instead of N separate calls.
+    """
+    pixel_area_ha = ee.Image.pixelArea().divide(1e4)
+    bands = []
+    for group_name, classes in CLASS_GROUPS.items():
+        mask = lulc_img.remap(classes, [1] * len(classes), 0)
+        band = pixel_area_ha.updateMask(mask).rename(group_name)
+        bands.append(band)
+    bands.append(pixel_area_ha.rename("total_area"))
+    return ee.Image.cat(bands)
+
+
+def safe_float(x):
+    try:
+        return float(x) if x is not None else np.nan
+    except Exception:
+        return np.nan
+
+# ------------------------------------------------------------
+# 8. Annual land-cover trajectories — 1 API call per year (40 total)
+# ------------------------------------------------------------
+# One reduceRegion per year computes all class groups simultaneously,
+# reducing API calls from ~400 (naive approach) to 40.
+
+print(f"\nComputing annual land-cover trajectories {START_YEAR}–{END_YEAR}...")
+
+records = []
+
+for i, year in enumerate(YEARS):
+    lulc  = clip_image_to_aoi(mapbiomas_raw.select(f"classification_{year}"), aoi_geom)
+    multi = build_multiband_area_image(lulc)
+
+    result = multi.reduceRegion(
+        reducer=ee.Reducer.sum(),
+        geometry=aoi_geom,
+        scale=30, maxPixels=1e13, bestEffort=True
+    ).getInfo()
+
+    row = {"year": year}
+    row["total_area_ha"] = safe_float(result.get("total_area"))
+    for group_name in CLASS_GROUPS.keys():
+        row[f"{group_name}_ha"] = safe_float(result.get(group_name))
+    records.append(row)
+
+    if (i + 1) % 10 == 0:
+        print(f"  {i + 1}/{len(YEARS)} years processed...")
+
+lulc_df = pd.DataFrame(records)
+
+# Percentage share
+for g in CLASS_GROUPS.keys():
+    lulc_df[f"{g}_pct"] = lulc_df[f"{g}_ha"] / lulc_df["total_area_ha"] * 100
+
+# Cumulative change since START_YEAR
+base_row = lulc_df[lulc_df["year"] == START_YEAR].iloc[0]
+for g in CLASS_GROUPS.keys():
+    lulc_df[f"{g}_change_ha"]  = lulc_df[f"{g}_ha"]  - base_row[f"{g}_ha"]
+    lulc_df[f"{g}_change_pct"] = lulc_df[f"{g}_pct"] - base_row[f"{g}_pct"]
+
+# Mean annual rate of change (ha/yr)
+last_row    = lulc_df[lulc_df["year"] == END_YEAR].iloc[0]
+annual_rate = {
+    g: round((last_row[f"{g}_ha"] - base_row[f"{g}_ha"]) / (END_YEAR - START_YEAR), 2)
+    for g in CLASS_GROUPS.keys()
+}
+
+# Export
+traj_path = DIRS["tables"] / f"nci_br_sjc_mapbiomas_trajectories_{START_YEAR}_{END_YEAR}.csv"
+rate_path = DIRS["tables"] / "nci_br_sjc_mapbiomas_annual_rate.csv"
+
+lulc_df.to_csv(traj_path, index=False, encoding="utf-8-sig")
+pd.DataFrame(
+    list(annual_rate.items()), columns=["group", "annual_change_ha_per_yr"]
+).to_csv(rate_path, index=False, encoding="utf-8-sig")
+
+print(f"\nTrajectories exported : {traj_path}")
+print(f"Annual rates exported : {rate_path}")
+logger.info(f"Trajectories: {len(lulc_df)} years | groups: {list(CLASS_GROUPS.keys())}")
+
+# ------------------------------------------------------------
+# 9. Grid-level land-cover indicators — baseline year
+# ------------------------------------------------------------
+
+print(f"\nComputing grid-level indicators for baseline year {BASELINE_YEAR}...")
+
+lulc_baseline  = clip_image_to_aoi(
+    mapbiomas_raw.select(f"classification_{BASELINE_YEAR}"), aoi_geom
+)
+multi_baseline = build_multiband_area_image(lulc_baseline)
+
+
+def add_grid_lulc_indicators(feature):
+    """Compute land-cover indicators for each grid cell."""
+    geom   = feature.geometry()
+    result = multi_baseline.reduceRegion(
+        reducer=ee.Reducer.sum(), geometry=geom,
+        scale=30, maxPixels=1e13, bestEffort=True
+    )
+    out = feature.set("total_area_ha_ee", result.get("total_area"))
+    for g in CLASS_GROUPS.keys():
+        area  = result.get(g)
+        total = result.get("total_area")
+        pct   = ee.Number(area).divide(ee.Number(total)).multiply(100)
+        out   = out.set(f"{g}_ha_{BASELINE_YEAR}", area)
+        out   = out.set(f"{g}_pct_{BASELINE_YEAR}", pct)
+    return out
+
+
+# Note: if geemap.ee_to_gdf times out for large grids, use Export instead:
+#
+#   task = ee.batch.Export.table.toDrive(
+#       collection  = grid_ee.map(add_grid_lulc_indicators),
+#       description = f"nci_br_sjc_grid_lulc_{BASELINE_YEAR}",
+#       folder      = "NCI_BR_Exports",
+#       fileFormat  = "CSV"
+#   )
+#   task.start()
+#   print(f"Export task started: {task.id}")
+
+grid_lulc_ee  = grid_ee.map(add_grid_lulc_indicators)
+grid_lulc_gdf = geemap.ee_to_gdf(grid_lulc_ee)
+
+if grid_lulc_gdf.crs is None:
+    grid_lulc_gdf = grid_lulc_gdf.set_crs("EPSG:4326")
+
+grid_lulc_path = DIRS["processed"] / f"nci_br_sjc_grid_lulc_{BASELINE_YEAR}.gpkg"
+grid_lulc_csv  = DIRS["tables"]    / f"nci_br_sjc_grid_lulc_{BASELINE_YEAR}.csv"
+
+grid_lulc_gdf.to_file(grid_lulc_path, layer=f"grid_lulc_{BASELINE_YEAR}", driver="GPKG")
+pd.DataFrame(grid_lulc_gdf.drop(columns="geometry")).to_csv(
+    grid_lulc_csv, index=False, encoding="utf-8-sig"
+)
+print(f"Grid LULC GPKG : {grid_lulc_path}")
+print(f"Grid LULC CSV  : {grid_lulc_csv}")
+
+# Summary statistics per group
+summary_records = []
+for g in CLASS_GROUPS.keys():
+    col = f"{g}_pct_{BASELINE_YEAR}"
+    if col in grid_lulc_gdf.columns:
+        v = pd.to_numeric(grid_lulc_gdf[col], errors="coerce")
+        summary_records.append({
+            "group":   g,
+            "mean":    round(v.mean(),              2),
+            "median":  round(v.median(),            2),
+            "std":     round(v.std(),               2),
+            "min":     round(v.min(),               4),
+            "q25":     round(v.quantile(0.25),      2),
+            "q75":     round(v.quantile(0.75),      2),
+            "max":     round(v.max(),               2),
+            "n_cells": int(v.notna().sum()),
+        })
+
+summary_df   = pd.DataFrame(summary_records)
+summary_path = DIRS["tables"] / f"nci_br_sjc_grid_lulc_summary_{BASELINE_YEAR}.csv"
+summary_df.to_csv(summary_path, index=False, encoding="utf-8-sig")
+print(f"Summary stats  : {summary_path}")
+
+# ------------------------------------------------------------
+# 10. Grid-level land-cover change map — START_YEAR to BASELINE_YEAR
+# ------------------------------------------------------------
+
+print(f"\nComputing grid-level change map {START_YEAR}→{END_YEAR}...")
+
+lulc_1985  = clip_image_to_aoi(
+    mapbiomas_raw.select(f"classification_{START_YEAR}"), aoi_geom
+)
+multi_1985 = build_multiband_area_image(lulc_1985)
+
+
+def add_grid_change(feature):
+    """Compute native vegetation and anthropic change per grid cell."""
+    geom     = feature.geometry()
+    res_base = multi_baseline.reduceRegion(
+        reducer=ee.Reducer.sum(), geometry=geom, scale=30,
+        maxPixels=1e13, bestEffort=True
+    )
+    res_1985 = multi_1985.reduceRegion(
+        reducer=ee.Reducer.sum(), geometry=geom, scale=30,
+        maxPixels=1e13, bestEffort=True
+    )
+    nv_base   = ee.Number(res_base.get("native_vegetation"))
+    nv_1985   = ee.Number(res_1985.get("native_vegetation"))
+    total     = ee.Number(res_base.get("total_area"))
+    delta_ha  = nv_base.subtract(nv_1985)
+    delta_pct = delta_ha.divide(total).multiply(100)
+
+    return feature.set({
+        "nv_ha_1985":          res_1985.get("native_vegetation"),
+        "nv_ha_baseline":      res_base.get("native_vegetation"),
+        "nv_delta_ha":         delta_ha,
+        "nv_delta_pct":        delta_pct,
+        "anthro_ha_1985":      res_1985.get("anthropic"),
+        "anthro_ha_baseline":  res_base.get("anthropic"),
+        "anthro_delta_ha":     ee.Number(res_base.get("anthropic"))
+                               .subtract(ee.Number(res_1985.get("anthropic"))),
+    })
+
+
+grid_change_ee  = grid_ee.map(add_grid_change)
+grid_change_gdf = geemap.ee_to_gdf(grid_change_ee)
+
+if grid_change_gdf.crs is None:
+    grid_change_gdf = grid_change_gdf.set_crs("EPSG:4326")
+
+grid_change_path = DIRS["processed"] / f"nci_br_sjc_grid_change_{START_YEAR}_{END_YEAR}.gpkg"
+grid_change_csv  = DIRS["tables"]    / f"nci_br_sjc_grid_change_{START_YEAR}_{END_YEAR}.csv"
+
+grid_change_gdf.to_file(grid_change_path, layer="grid_change", driver="GPKG")
+pd.DataFrame(grid_change_gdf.drop(columns="geometry")).to_csv(
+    grid_change_csv, index=False, encoding="utf-8-sig"
+)
+print(f"Change map exported: {grid_change_path}")
+
+# ------------------------------------------------------------
+# 11. Prepare plotting layers
+# ------------------------------------------------------------
+
+muni_plot        = muni_gdf.to_crs(plot_crs)
+grid_lulc_plot   = grid_lulc_gdf.to_crs(plot_crs)
+grid_change_plot = grid_change_gdf.to_crs(plot_crs)
+
+# Cast indicator columns to numeric
+for col in grid_lulc_plot.columns:
+    if any(g in col for g in CLASS_GROUPS.keys()) or "total_area" in col:
+        grid_lulc_plot[col] = pd.to_numeric(grid_lulc_plot[col], errors="coerce")
+
+for col in ["nv_delta_ha", "nv_delta_pct", "anthro_delta_ha",
+            "nv_ha_1985", "nv_ha_baseline",
+            "anthro_ha_1985", "anthro_ha_baseline"]:
+    if col in grid_change_plot.columns:
+        grid_change_plot[col] = pd.to_numeric(grid_change_plot[col], errors="coerce")
+
+native_col = f"native_vegetation_pct_{BASELINE_YEAR}"
+anthro_col = f"anthropic_pct_{BASELINE_YEAR}"
+
+xmin, ymin, xmax, ymax = muni_plot.total_bounds
+xbuf = (xmax - xmin) * 0.05
+ybuf = (ymax - ymin) * 0.05
+map_extent = [xmin - xbuf, xmax + xbuf, ymin - ybuf, ymax + ybuf]
+
+
+def add_panel_label(ax, label):
+    ax.text(0.02, 0.97, label, transform=ax.transAxes,
+            fontsize=12, fontweight="bold", va="top", ha="left",
+            bbox=dict(facecolor="white", edgecolor="none",
+                      alpha=0.88, boxstyle="round,pad=0.22"))
+
+
+def overlay_boundary(ax, gdf):
+    """Overlay municipal boundary on any map panel."""
+    gdf.boundary.plot(ax=ax, edgecolor="black", linewidth=1.2, zorder=5)
+
+# ------------------------------------------------------------
+# 12. High-quality composite figure — 9 panels
+# ------------------------------------------------------------
+
+plt.rcParams.update({
+    "figure.dpi": 150, "savefig.dpi": CONFIG["figure_dpi"],
+    "font.family": "DejaVu Sans", "font.size": 9.5,
+    "axes.titlesize": 10, "axes.labelsize": 9,
+    "legend.fontsize": 8.5, "axes.linewidth": 0.7,
+    "pdf.fonttype": 42, "ps.fonttype": 42, "savefig.bbox": "tight",
+})
+
+fig = plt.figure(figsize=(16, 11), dpi=150)
+gs  = fig.add_gridspec(
+    nrows=3, ncols=3,
+    width_ratios=[1.2, 1.2, 1.0],
+    height_ratios=[1, 1, 1],
+    wspace=0.22, hspace=0.32
+)
+
+ax_a = fig.add_subplot(gs[0, 0])
+ax_b = fig.add_subplot(gs[0, 1])
+ax_c = fig.add_subplot(gs[0, 2])
+ax_d = fig.add_subplot(gs[1, 0])
+ax_e = fig.add_subplot(gs[1, 1])
+ax_f = fig.add_subplot(gs[1, 2])
+ax_g = fig.add_subplot(gs[2, 0])
+ax_h = fig.add_subplot(gs[2, 1])
+ax_i = fig.add_subplot(gs[2, 2])
+
+# ── Panel a — Native vegetation trajectory ───────────────────
+ax_a.plot(lulc_df["year"], lulc_df["native_vegetation_pct"],
+          color="#1a7a3c", linewidth=2.2)
+ax_a.fill_between(lulc_df["year"], lulc_df["native_vegetation_pct"],
+                  alpha=0.12, color="#1a7a3c")
+ax_a.set_title("Native vegetation (%)", loc="left")
+ax_a.set_ylabel("Area share (%)")
+ax_a.set_xlabel("Year")
+ax_a.grid(True, linewidth=0.3, alpha=0.5)
+add_panel_label(ax_a, "a")
+
+# ── Panel b — Anthropogenic pressure trajectory ───────────────
+ax_b.plot(lulc_df["year"], lulc_df["anthropic_pct"],
+          color="#b2182b", linewidth=2.2)
+ax_b.fill_between(lulc_df["year"], lulc_df["anthropic_pct"],
+                  alpha=0.12, color="#b2182b")
+ax_b.set_title("Anthropogenic pressure (%)", loc="left")
+ax_b.set_ylabel("Area share (%)")
+ax_b.set_xlabel("Year")
+ax_b.grid(True, linewidth=0.3, alpha=0.5)
+add_panel_label(ax_b, "b")
+
+# ── Panel c — Cumulative change since 1985 ────────────────────
+chg_groups = ["native_vegetation", "agriculture_pasture",
+              "urban", "water", "forest"]
+chg_labels = ["Native\nveg.", "Agri./\nPasture", "Urban", "Water", "Forest"]
+chg_values = [lulc_df.iloc[-1][f"{g}_change_ha"] for g in chg_groups]
+bar_colors = ["#1a7a3c" if v >= 0 else "#b2182b" for v in chg_values]
+
+ax_c.bar(chg_labels, chg_values, color=bar_colors, edgecolor="white", linewidth=0.5)
+ax_c.axhline(0, color="black", linewidth=0.8)
+ax_c.set_title(f"Cumulative change {START_YEAR}→{END_YEAR} (ha)", loc="left")
+ax_c.set_ylabel("Δ area (ha)")
+ax_c.tick_params(axis="x", labelsize=8)
+ax_c.grid(axis="y", linewidth=0.3, alpha=0.5)
+add_panel_label(ax_c, "c")
+
+# ── Panel d — Native vegetation per 1-km cell (baseline) ─────
+grid_lulc_plot.plot(
+    column=native_col, ax=ax_d,
+    cmap="Greens", linewidth=0.0, legend=True,
+    legend_kwds={"label": "Native vegetation (%)", "shrink": 0.7},
+    missing_kwds={"color": "lightgrey"},
+    vmin=0, vmax=100
+)
+overlay_boundary(ax_d, muni_plot)
+ax_d.set_xlim(map_extent[0], map_extent[1])
+ax_d.set_ylim(map_extent[2], map_extent[3])
+ax_d.set_title(f"Native vegetation per 1-km cell ({BASELINE_YEAR})", loc="left")
+ax_d.set_axis_off()
+add_panel_label(ax_d, "d")
+
+# ── Panel e — Anthropogenic pressure per 1-km cell (baseline) ─
+grid_lulc_plot.plot(
+    column=anthro_col, ax=ax_e,
+    cmap="OrRd", linewidth=0.0, legend=True,
+    legend_kwds={"label": "Anthropogenic pressure (%)", "shrink": 0.7},
+    missing_kwds={"color": "lightgrey"},
+    vmin=0, vmax=100
+)
+overlay_boundary(ax_e, muni_plot)
+ax_e.set_xlim(map_extent[0], map_extent[1])
+ax_e.set_ylim(map_extent[2], map_extent[3])
+ax_e.set_title(f"Anthropogenic pressure per 1-km cell ({BASELINE_YEAR})", loc="left")
+ax_e.set_axis_off()
+add_panel_label(ax_e, "e")
+
+# ── Panel f — Grid summary statistics table ───────────────────
+ax_f.axis("off")
+
+sel_groups = ["native_vegetation", "forest",
+              "agriculture_pasture", "urban", "anthropic"]
+sel_df = summary_df[summary_df["group"].isin(sel_groups)].copy()
+sel_df["group"] = sel_df["group"].str.replace("_", " ").str.title()
+
+for col in ["mean", "median", "q75"]:
+    sel_df[col] = sel_df[col].map(lambda x: f"{x:.1f}")
+
+table = ax_f.table(
+    cellText=sel_df[["group", "mean", "median", "q75"]].values,
+    colLabels=["Group", "Mean %", "Median %", "Q75 %"],
+    loc="center", cellLoc="center"
+)
+table.auto_set_font_size(False)
+table.set_fontsize(7.8)
+table.scale(1.0, 1.4)
+for (row, col), cell in table.get_celld().items():
+    cell.set_edgecolor("#bdbdbd")
+    cell.set_linewidth(0.5)
+    if row == 0:
+        cell.set_facecolor("#f0f0f0")
+        cell.set_text_props(weight="bold")
+ax_f.set_title(f"Grid summary statistics ({BASELINE_YEAR})", loc="left")
+add_panel_label(ax_f, "f")
+
+# ── Panel g — Native vegetation change map 1985→baseline ──────
+delta_col = "nv_delta_pct"
+if delta_col in grid_change_plot.columns and grid_change_plot[delta_col].notna().any():
+    vmax_abs = max(
+        abs(float(grid_change_plot[delta_col].quantile(0.02))),
+        abs(float(grid_change_plot[delta_col].quantile(0.98))),
+        1.0
+    )
+    norm_div = TwoSlopeNorm(vmin=-vmax_abs, vcenter=0, vmax=vmax_abs)
+    grid_change_plot.plot(
+        column=delta_col, ax=ax_g,
+        cmap="RdYlGn", norm=norm_div, linewidth=0.0, legend=True,
+        legend_kwds={"label": "Δ Native veg. (%)", "shrink": 0.7},
+        missing_kwds={"color": "lightgrey"}
+    )
+    overlay_boundary(ax_g, muni_plot)
+    ax_g.set_xlim(map_extent[0], map_extent[1])
+    ax_g.set_ylim(map_extent[2], map_extent[3])
+    ax_g.set_title(f"Native vegetation change {START_YEAR}→{END_YEAR} (%)", loc="left")
+    ax_g.set_axis_off()
+else:
+    ax_g.axis("off")
+    ax_g.text(0.5, 0.5, "Change data\nnot available",
+              ha="center", va="center", transform=ax_g.transAxes)
+add_panel_label(ax_g, "g")
+
+# ── Panel h — Forest / agriculture / urban trajectories ───────
+ax_h.plot(lulc_df["year"], lulc_df["forest_pct"],
+          color="#005a32", linewidth=1.8, label="Forest")
+ax_h.plot(lulc_df["year"], lulc_df["agriculture_pasture_pct"],
+          color="#d95f02", linewidth=1.8, label="Agriculture / Pasture")
+ax_h.plot(lulc_df["year"], lulc_df["urban_pct"],
+          color="#7570b3", linewidth=1.8, label="Urban")
+ax_h.set_title("Trajectories by land-cover category", loc="left")
+ax_h.set_ylabel("Area share (%)")
+ax_h.set_xlabel("Year")
+ax_h.legend(fontsize=7.5, framealpha=0.85)
+ax_h.grid(True, linewidth=0.3, alpha=0.5)
+add_panel_label(ax_h, "h")
+
+# ── Panel i — Mean annual rate of change (ha/yr) ──────────────
+top_rates = sorted(annual_rate.items(), key=lambda x: abs(x[1]), reverse=True)[:6]
+r_labels  = [g[0].replace("_", " ").title() for g in top_rates]
+r_values  = [g[1] for g in top_rates]
+r_colors  = ["#1a7a3c" if v >= 0 else "#b2182b" for v in r_values]
+
+ax_i.barh(r_labels, r_values, color=r_colors, edgecolor="white", linewidth=0.5)
+ax_i.axvline(0, color="black", linewidth=0.8)
+ax_i.set_title(f"Mean annual rate {START_YEAR}–{END_YEAR} (ha/yr)", loc="left")
+ax_i.set_xlabel("ha / yr")
+ax_i.tick_params(axis="y", labelsize=8)
+ax_i.grid(axis="x", linewidth=0.3, alpha=0.5)
+add_panel_label(ax_i, "i")
+
+fig.suptitle(
+    f"Land-cover trajectories and spatial structure — NCI-BR | {MUNICIPALITY}, SP ({START_YEAR}–{END_YEAR})",
+    fontsize=13, fontweight="bold", y=0.995
+)
+fig.text(
+    0.02, 0.005,
+    "Data: MapBiomas Collection 10 | Analytical unit: 1-km grid clipped to IBGE municipal boundary.",
+    fontsize=7.5, color="#4d4d4d"
+)
+
+fig_png = DIRS["figures"] / "figure_02_nci_br_sjc_mapbiomas_trajectories.png"
+fig_pdf = DIRS["figures"] / "figure_02_nci_br_sjc_mapbiomas_trajectories.pdf"
+
+plt.savefig(fig_png, dpi=CONFIG["figure_dpi"], bbox_inches="tight")
+plt.savefig(fig_pdf, dpi=CONFIG["figure_dpi"], bbox_inches="tight")
+plt.show()
+
+print(f"\nFigure exported:\n  {fig_png}\n  {fig_pdf}")
+logger.info(f"Figure exported: {fig_png}")
+
+# ------------------------------------------------------------
+# 13. MD5 checksums
+# ------------------------------------------------------------
+
+def md5_checksum(fp: Path) -> str:
+    h = hashlib.md5()
+    with open(fp, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+checksum_files = [traj_path, grid_lulc_path, grid_change_path]
+checksums      = {fp.name: md5_checksum(fp) for fp in checksum_files}
+checksums_path = DIRS["metadata"] / "nci_br_block03_checksums.json"
+with open(checksums_path, "w") as f:
+    json.dump(checksums, f, indent=4)
+print(f"MD5 checksums: {checksums_path}")
+
+# ------------------------------------------------------------
+# 14. Block metadata
+# ------------------------------------------------------------
+
+block03_metadata = {
+    "block":              "03",
+    "version":            "final",
+    "municipality":       MUNICIPALITY,
+    "ibge_code":          3549904,
+    "years":              [START_YEAR, END_YEAR],
+    "baseline_year":      BASELINE_YEAR,
+    "class_groups":       CLASS_GROUPS,
+    "annual_rate_ha_per_yr": annual_rate,
+    "outputs": {
+        "trajectories_csv":  str(traj_path),
+        "annual_rates_csv":  str(rate_path),
+        "grid_lulc_gpkg":    str(grid_lulc_path),
+        "grid_lulc_csv":     str(grid_lulc_csv),
+        "grid_change_gpkg":  str(grid_change_path),
+        "grid_change_csv":   str(grid_change_csv),
+        "summary_stats_csv": str(summary_path),
+        "figure_png":        str(fig_png),
+        "figure_pdf":        str(fig_pdf),
+        "checksums":         str(checksums_path),
+    },
+    "created_at": datetime.now().isoformat(),
+}
+
+metadata_path = DIRS["metadata"] / "nci_br_block03_metadata.json"
+with open(metadata_path, "w", encoding="utf-8") as f:
+    json.dump(block03_metadata, f, indent=4, ensure_ascii=False)
+print(f"Metadata saved: {metadata_path}")
+logger.info("Block 03 completed — Sao Jose dos Campos.")
+
+# ------------------------------------------------------------
+# 15. Final summary
+# ------------------------------------------------------------
+
+last_nv  = lulc_df[lulc_df["year"] == END_YEAR]["native_vegetation_pct"].iloc[0]
+base_nv  = lulc_df[lulc_df["year"] == START_YEAR]["native_vegetation_pct"].iloc[0]
+last_urb = lulc_df[lulc_df["year"] == END_YEAR]["urban_pct"].iloc[0]
+base_urb = lulc_df[lulc_df["year"] == START_YEAR]["urban_pct"].iloc[0]
+
+print("\n" + "=" * 62)
+print(f"BLOCK 03 — COMPLETED | {MUNICIPALITY}")
+print("=" * 62)
+print(f"  Period            : {START_YEAR}–{END_YEAR}")
+print(f"  Baseline year     : {BASELINE_YEAR}")
+print(f"  Grid cells        : {len(grid_lulc_gdf)}")
+print(f"\n  Native veg. {START_YEAR} : {base_nv:.1f} %")
+print(f"  Native veg. {END_YEAR} : {last_nv:.1f} %")
+print(f"  Δ native veg.     : {last_nv - base_nv:+.1f} p.p.")
+print(f"\n  Urban {START_YEAR}       : {base_urb:.1f} %")
+print(f"  Urban {END_YEAR}       : {last_urb:.1f} %")
+print(f"  Δ urban           : {last_urb - base_urb:+.1f} p.p.")
+print(f"\n  Top annual rates (ha/yr):")
+for g, r in sorted(annual_rate.items(), key=lambda x: abs(x[1]), reverse=True)[:4]:
+    print(f"    {g:<28}: {r:+.1f}")
+print("=" * 62)
+print("\nNext block: NDVI/EVI — vegetation condition, trends,")
+print("and ecosystem health indicators per grid cell.")
