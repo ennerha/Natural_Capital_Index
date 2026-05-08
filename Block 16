@@ -1,0 +1,1294 @@
+# ============================================================
+# BRAZIL NCI-BR PROJECT
+# BLOCK 16 — FINAL SCIENTIFIC SYNTHESIS FIGURE
+# REAL DATA ONLY — NO SYNTHETIC SCENARIOS
+# FOCUS: SÃO JOSÉ DOS CAMPOS — SP, BRAZIL
+# ============================================================
+
+import io
+import json
+import logging
+import requests
+from pathlib import Path
+from datetime import datetime
+
+import pandas as pd
+import geopandas as gpd
+import numpy as np
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import matplotlib.gridspec as gridspec
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+from shapely.geometry import box as shapely_box
+from shapely.ops import unary_union
+
+# ------------------------------------------------------------
+# Global aesthetics
+# ------------------------------------------------------------
+
+mpl.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 9,
+    "axes.titlesize": 9,
+    "axes.titleweight": "bold",
+    "axes.titlepad": 5,
+    "axes.labelsize": 8,
+    "xtick.labelsize": 7,
+    "ytick.labelsize": 7,
+    "legend.fontsize": 7,
+    "legend.framealpha": 0.92,
+    "legend.edgecolor": "#cccccc",
+    "figure.facecolor": "white",
+    "axes.facecolor": "white",
+    "savefig.facecolor": "white",
+    "savefig.dpi": 300,
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+})
+
+PALETTE = {
+    "background": "#FAFAFA",
+    "panel_border": "#D0D0D0",
+    "title_text": "#1A1A2E",
+    "body_text": "#3D3D3D",
+    "na_color": "#E8E8E8",
+    "header_bg": "#1A3A5C",
+    "header_fg": "white",
+    "row_odd": "#F4F8FC",
+    "row_even": "white",
+    "accent": "#2B6CB0",
+    "boundary": "#1A1A2E",
+}
+
+CLASS_COLORS = {
+    "Observed native conversion in high-NCI cell": "#7f0000",
+    "Observed urban expansion in high-NCI cell": "#d7301f",
+    "Robust high-NCI floodplain priority": "#2b8cbe",
+    "Robust high-NCI conservation priority": "#006d2c",
+    "Observed urban expansion": "#f6a623",
+    "Other / lower priority": "#d4d4d4",
+}
+
+# ------------------------------------------------------------
+# 1. Configuration
+# ------------------------------------------------------------
+
+PROJECT_ROOT = Path("/content/drive/MyDrive/Brazil/NCI_BR_Project")
+
+DIRS = {
+    "root": PROJECT_ROOT,
+    "processed": PROJECT_ROOT / "03_processed",
+    "tables": PROJECT_ROOT / "04_tables",
+    "figures": PROJECT_ROOT / "05_figures",
+    "logs": PROJECT_ROOT / "08_logs",
+    "metadata": PROJECT_ROOT / "09_metadata",
+}
+
+for d in DIRS.values():
+    d.mkdir(parents=True, exist_ok=True)
+
+with open(DIRS["metadata"] / "nci_br_config.json", "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
+
+BASELINE_YEAR = int(CONFIG["baseline_year"])
+OUTPUT_CRS = CONFIG.get("output_crs", "EPSG:5880")
+FIG_DPI = CONFIG.get("figure_dpi", 500)
+
+MUNICIPALITY = "São José dos Campos"
+MUNI_CODE = "3549904"
+
+# ------------------------------------------------------------
+# 2. Logging
+# ------------------------------------------------------------
+
+log_file = (
+    DIRS["logs"]
+    / f"nci_br_block16_sjc_final_synthesis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+)
+
+logging.basicConfig(
+    filename=log_file,
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+logger = logging.getLogger("NCI_BR_BLOCK16_SJC")
+logger.info(f"Block 16 started — {MUNICIPALITY}.")
+print(f"Log file: {log_file}")
+
+# ------------------------------------------------------------
+# 3. Load real-data products
+# ------------------------------------------------------------
+
+synthesis_candidates = [
+    DIRS["processed"] / "nci_br_sjc_real_data_evidence_synthesis_map.gpkg",
+    DIRS["processed"] / "nci_br_real_data_evidence_synthesis_map.gpkg",
+    DIRS["processed"] / "nci_br_sjc_evidence_synthesis.gpkg",
+]
+
+uncertainty_candidates = [
+    DIRS["processed"] / "nci_br_sjc_uncertainty_sensitivity_analysis.gpkg",
+    DIRS["processed"] / "nci_br_uncertainty_sensitivity_analysis.gpkg",
+]
+
+fragmentation_candidates = [
+    DIRS["processed"] / "nci_br_sjc_fragmentation_connectivity.gpkg",
+    DIRS["processed"] / "nci_br_fragmentation_connectivity_metrics.gpkg",
+]
+
+floodplain_candidates = [
+    DIRS["processed"] / "nci_br_sjc_floodplain_occupation_diagnostics.gpkg",
+    DIRS["processed"] / "nci_br_floodplain_occupation_diagnostics.gpkg",
+]
+
+synthesis_path = next((p for p in synthesis_candidates if p.exists()), None)
+uncertainty_path = next((p for p in uncertainty_candidates if p.exists()), None)
+fragmentation_path = next((p for p in fragmentation_candidates if p.exists()), None)
+floodplain_path = next((p for p in floodplain_candidates if p.exists()), None)
+
+required_paths = {
+    "synthesis_path": synthesis_path,
+    "uncertainty_path": uncertainty_path,
+    "fragmentation_path": fragmentation_path,
+    "floodplain_path": floodplain_path,
+}
+
+missing = [k for k, v in required_paths.items() if v is None]
+if missing:
+    raise FileNotFoundError(f"Missing required product(s): {missing}")
+
+gdf = gpd.read_file(synthesis_path).to_crs(OUTPUT_CRS)
+uncertainty_gdf = gpd.read_file(uncertainty_path).to_crs(OUTPUT_CRS)
+frag_gdf = gpd.read_file(fragmentation_path).to_crs(OUTPUT_CRS)
+flood_gdf = gpd.read_file(floodplain_path).to_crs(OUTPUT_CRS)
+
+print("All real-data spatial products loaded:")
+print(f"  synthesis     : {synthesis_path.name}")
+print(f"  uncertainty   : {uncertainty_path.name}")
+print(f"  fragmentation : {fragmentation_path.name}")
+print(f"  floodplain    : {floodplain_path.name}")
+
+# Optional tables
+final_results_path = DIRS["tables"] / "nci_br_final_manuscript_ready_results.csv"
+observed_summary_path = DIRS["tables"] / "nci_br_observed_conversion_summary.csv"
+frag_summary_path = DIRS["tables"] / "nci_br_fragmentation_change_summary.csv"
+uncertainty_summary_path = DIRS["tables"] / "nci_br_uncertainty_summary.csv"
+regression_coef_path = DIRS["tables"] / "nci_br_spatial_regression_coefficients.csv"
+regression_model_path = DIRS["tables"] / "nci_br_spatial_regression_model_comparison.csv"
+
+final_results = pd.read_csv(final_results_path) if final_results_path.exists() else pd.DataFrame()
+observed_summary = pd.read_csv(observed_summary_path) if observed_summary_path.exists() else pd.DataFrame()
+frag_summary = pd.read_csv(frag_summary_path) if frag_summary_path.exists() else pd.DataFrame()
+uncertainty_summary_in = pd.read_csv(uncertainty_summary_path) if uncertainty_summary_path.exists() else pd.DataFrame()
+regression_coef = pd.read_csv(regression_coef_path) if regression_coef_path.exists() else pd.DataFrame()
+regression_model = pd.read_csv(regression_model_path) if regression_model_path.exists() else pd.DataFrame()
+
+# ------------------------------------------------------------
+# 3b. Municipal boundary — São José dos Campos only
+# ------------------------------------------------------------
+
+muni_path = DIRS["processed"] / "nci_br_sjc_municipality.gpkg"
+
+if not muni_path.exists():
+    print("nci_br_sjc_municipality.gpkg not found.")
+    print("Downloading real SJC boundary from IBGE API...")
+
+    url = (
+        "https://servicodados.ibge.gov.br/api/v3/malhas/municipios"
+        f"/{MUNI_CODE}?formato=application/json&qualidade=maxima"
+    )
+
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+
+    muni_gdf = gpd.read_file(io.BytesIO(resp.content))
+    muni_gdf = muni_gdf.set_crs("EPSG:4326").to_crs("EPSG:4674")
+    muni_gdf["NM_MUN"] = MUNICIPALITY
+    muni_gdf["CD_MUN"] = MUNI_CODE
+    muni_gdf["SIGLA_UF"] = "SP"
+    muni_gdf.to_file(muni_path, driver="GPKG")
+
+    print(f"Saved to: {muni_path}")
+
+else:
+    muni_gdf = gpd.read_file(muni_path)
+    print(f"Municipal boundary loaded: {muni_path.name}")
+
+if muni_gdf.crs is None:
+    muni_gdf = muni_gdf.set_crs("EPSG:4674")
+
+muni_boundary = muni_gdf.to_crs(OUTPUT_CRS).dissolve()[["geometry"]].reset_index(drop=True)
+muni_indiv = muni_boundary.copy()
+muni_indiv["name_muni"] = MUNICIPALITY
+
+bounds = muni_boundary.total_bounds
+xbuf = (bounds[2] - bounds[0]) * 0.05
+ybuf = (bounds[3] - bounds[1]) * 0.05
+
+MAP_XLIM = (bounds[0] - xbuf, bounds[2] + xbuf)
+MAP_YLIM = (bounds[1] - ybuf, bounds[3] + ybuf)
+
+print(f"Municipality : {MUNICIPALITY}")
+print(f"Map extent   : x {MAP_XLIM}, y {MAP_YLIM}")
+
+_bbox = shapely_box(MAP_XLIM[0], MAP_YLIM[0], MAP_XLIM[1], MAP_YLIM[1])
+_muni_union = unary_union(muni_boundary.geometry.values)
+_mask_geom = _bbox.difference(_muni_union)
+
+mask_gdf = gpd.GeoDataFrame(
+    geometry=[_mask_geom],
+    crs=muni_boundary.crs,
+)
+
+# ------------------------------------------------------------
+# 4. Core columns
+# ------------------------------------------------------------
+
+REF_YEAR = 1985
+TARGET_YEAR = BASELINE_YEAR
+
+new_urban_col = f"observed_new_urban_{REF_YEAR}_{TARGET_YEAR}_ha"
+native_to_urban_col = f"native_to_urban_{REF_YEAR}_{TARGET_YEAR}_ha"
+nci_exposed_col = f"NCI_exposed_by_observed_conversion_{REF_YEAR}_{TARGET_YEAR}"
+
+required_cols = [
+    "grid_id",
+    "NCI_BR",
+    new_urban_col,
+    native_to_urban_col,
+    nci_exposed_col,
+]
+
+for col in required_cols:
+    if col not in gdf.columns:
+        raise ValueError(f"Required column missing in synthesis layer: {col}")
+
+for col in ["NCI_BR", new_urban_col, native_to_urban_col, nci_exposed_col]:
+    gdf[col] = pd.to_numeric(gdf[col], errors="coerce").fillna(0)
+
+# ------------------------------------------------------------
+# 4a. Merge ancillary layers
+# ------------------------------------------------------------
+
+def safe_keep(df, cols):
+    return [c for c in cols if c in df.columns]
+
+
+analysis = gdf.merge(
+    uncertainty_gdf[
+        safe_keep(
+            uncertainty_gdf,
+            [
+                "grid_id",
+                "NCI_BR_mc_std",
+                "NCI_BR_mc_range90",
+                "prob_high_nci_q75",
+                "prob_very_high_nci_q90",
+                "high_nci_robustness_class",
+            ],
+        )
+    ].drop(columns="geometry", errors="ignore"),
+    on="grid_id",
+    how="left",
+)
+
+analysis = analysis.merge(
+    frag_gdf[
+        safe_keep(
+            frag_gdf,
+            [
+                "grid_id",
+                f"native_fraction_{BASELINE_YEAR}",
+                "native_frac_change",
+                "native_fraction_change_1985_2024",
+                "fragmentation_risk",
+                "fragmentation_risk_score",
+                "connectivity_score",
+                "connectivity_conservation_score",
+            ],
+        )
+    ].drop(columns="geometry", errors="ignore"),
+    on="grid_id",
+    how="left",
+)
+
+analysis = analysis.merge(
+    flood_gdf[
+        safe_keep(
+            flood_gdf,
+            [
+                "grid_id",
+                "floodplain_fraction",
+                "urban_conversion_inside_floodplain",
+                "NCI_exposed_inside_floodplain",
+            ],
+        )
+    ].drop(columns="geometry", errors="ignore"),
+    on="grid_id",
+    how="left",
+)
+
+# Harmonize possible column names
+if "connectivity_conservation_score" not in analysis.columns and "connectivity_score" in analysis.columns:
+    analysis["connectivity_conservation_score"] = analysis["connectivity_score"]
+
+if "fragmentation_risk_score" not in analysis.columns and "fragmentation_risk" in analysis.columns:
+    analysis["fragmentation_risk_score"] = analysis["fragmentation_risk"]
+
+if "native_fraction_change_1985_2024" not in analysis.columns and "native_frac_change" in analysis.columns:
+    analysis["native_fraction_change_1985_2024"] = analysis["native_frac_change"]
+
+for col in analysis.columns:
+    if col != "geometry":
+        try:
+            analysis[col] = pd.to_numeric(analysis[col], errors="ignore")
+        except Exception:
+            pass
+
+# ------------------------------------------------------------
+# 4b. Spatial clip to São José dos Campos
+# ------------------------------------------------------------
+
+print(f"\nGrid cells before SJC clip: {len(analysis)}")
+
+analysis = gpd.clip(analysis.to_crs(OUTPUT_CRS), muni_boundary)
+analysis = analysis[~analysis.is_empty].reset_index(drop=True)
+
+print(f"Grid cells after SJC clip:  {len(analysis)}")
+
+if len(analysis) == 0:
+    raise ValueError("No grid cells remained after clipping to SJC. Check CRS and input layers.")
+
+logger.info(f"Clipped to {len(analysis)} cells within São José dos Campos.")
+
+# Recompute clipped grid area
+analysis["grid_area_ha_clipped"] = analysis.geometry.area / 10_000
+
+if "grid_area_ha" not in analysis.columns:
+    analysis["grid_area_ha"] = analysis["grid_area_ha_clipped"]
+else:
+    analysis["grid_area_ha"] = pd.to_numeric(analysis["grid_area_ha"], errors="coerce")
+    analysis["grid_area_ha"] = analysis["grid_area_ha"].fillna(analysis["grid_area_ha_clipped"])
+
+# ------------------------------------------------------------
+# 5. Synthesis classes
+# ------------------------------------------------------------
+
+nci_q75 = analysis["NCI_BR"].quantile(0.75)
+
+analysis["converted_high_nci"] = (
+    analysis[new_urban_col] > 0
+) & (
+    analysis["NCI_BR"] >= nci_q75
+)
+
+analysis["native_converted_high_nci"] = (
+    analysis[native_to_urban_col] > 0
+) & (
+    analysis["NCI_BR"] >= nci_q75
+)
+
+analysis["robust_high_nci"] = (
+    analysis["prob_high_nci_q75"].ge(0.75)
+    if "prob_high_nci_q75" in analysis.columns
+    else pd.Series(False, index=analysis.index)
+)
+
+analysis["floodplain_priority"] = (
+    analysis["floodplain_fraction"].ge(0.50)
+    if "floodplain_fraction" in analysis.columns
+    else pd.Series(False, index=analysis.index)
+)
+
+
+def classify_final_evidence(row):
+    if row["native_converted_high_nci"]:
+        return "Observed native conversion in high-NCI cell"
+    if row["converted_high_nci"]:
+        return "Observed urban expansion in high-NCI cell"
+    if row["robust_high_nci"] and row["floodplain_priority"]:
+        return "Robust high-NCI floodplain priority"
+    if row["robust_high_nci"]:
+        return "Robust high-NCI conservation priority"
+    if row[new_urban_col] > 0:
+        return "Observed urban expansion"
+    return "Other / lower priority"
+
+
+analysis["final_evidence_class"] = analysis.apply(classify_final_evidence, axis=1)
+
+# ------------------------------------------------------------
+# 6. Core synthesis statistics
+# ------------------------------------------------------------
+
+grid_area_ha = analysis["grid_area_ha_clipped"].sum()
+
+total_new_urban = analysis[new_urban_col].sum()
+total_native_to_urban = analysis[native_to_urban_col].sum()
+total_nci_exposed = analysis[nci_exposed_col].sum()
+
+converted_high_nci_ha = analysis.loc[
+    analysis["converted_high_nci"],
+    new_urban_col,
+].sum()
+
+native_converted_high_nci_ha = analysis.loc[
+    analysis["native_converted_high_nci"],
+    native_to_urban_col,
+].sum()
+
+robust_high_nci_cells = int(analysis["robust_high_nci"].sum())
+
+urban_inside_floodplain = (
+    pd.to_numeric(
+        analysis["urban_conversion_inside_floodplain"],
+        errors="coerce",
+    ).fillna(0).sum()
+    if "urban_conversion_inside_floodplain" in analysis.columns
+    else np.nan
+)
+
+nci_inside_floodplain = (
+    pd.to_numeric(
+        analysis["NCI_exposed_inside_floodplain"],
+        errors="coerce",
+    ).fillna(0).sum()
+    if "NCI_exposed_inside_floodplain" in analysis.columns
+    else np.nan
+)
+
+synthesis_table = pd.DataFrame([
+    {
+        "Metric": f"Analysed municipal area",
+        "Value": f"{grid_area_ha:,.2f}",
+        "Unit": "ha",
+    },
+    {
+        "Metric": f"New urban/infrastructure area, {REF_YEAR}–{TARGET_YEAR}",
+        "Value": f"{total_new_urban:,.2f}",
+        "Unit": "ha",
+    },
+    {
+        "Metric": f"Native vegetation converted to urban/infrastructure, {REF_YEAR}–{TARGET_YEAR}",
+        "Value": f"{total_native_to_urban:,.2f}",
+        "Unit": "ha",
+    },
+    {
+        "Metric": "Area-weighted NCI-BR exposure",
+        "Value": f"{total_nci_exposed:,.2f}",
+        "Unit": "NCI × ha",
+    },
+    {
+        "Metric": "Observed urban expansion inside high-NCI cells",
+        "Value": f"{converted_high_nci_ha:,.2f}",
+        "Unit": "ha",
+    },
+    {
+        "Metric": "Native-to-urban conversion inside high-NCI cells",
+        "Value": f"{native_converted_high_nci_ha:,.4f}",
+        "Unit": "ha",
+    },
+    {
+        "Metric": "Robust high-NCI cells, ≥75% MC resamples",
+        "Value": f"{robust_high_nci_cells:,}",
+        "Unit": "cells",
+    },
+    {
+        "Metric": "Observed urban conversion inside floodplain",
+        "Value": f"{urban_inside_floodplain:,.2f}" if pd.notna(urban_inside_floodplain) else "NA",
+        "Unit": "ha",
+    },
+    {
+        "Metric": "NCI exposure inside floodplain",
+        "Value": f"{nci_inside_floodplain:,.2f}" if pd.notna(nci_inside_floodplain) else "NA",
+        "Unit": "NCI × ha",
+    },
+])
+
+class_summary = (
+    analysis.groupby("final_evidence_class")
+    .agg(
+        n_cells=("grid_id", "count"),
+        mean_NCI_BR=("NCI_BR", "mean"),
+        observed_new_urban_ha=(new_urban_col, "sum"),
+        native_to_urban_ha=(native_to_urban_col, "sum"),
+        NCI_exposed=(nci_exposed_col, "sum"),
+    )
+    .reset_index()
+    .sort_values("NCI_exposed", ascending=False)
+)
+
+# ------------------------------------------------------------
+# 7. Regression text
+# ------------------------------------------------------------
+
+regression_panel_text = ""
+
+if not regression_model.empty:
+    if "aic" in regression_model.columns:
+        best = regression_model.sort_values("aic").iloc[0]
+        model_name = best.get("model", "Best model")
+        r2_value = best.get("r2", np.nan)
+        aic_value = best.get("aic", np.nan)
+
+        regression_panel_text = (
+            f"Best spatial model by AIC: {model_name}\n"
+            f"R² / pseudo-R²: {r2_value:.3f}   |   AIC: {aic_value:.1f}"
+        )
+
+driver_lines = []
+
+if not regression_coef.empty:
+    coef_sub = regression_coef.copy()
+
+    if "model" in coef_sub.columns:
+        coef_sub = coef_sub[
+            coef_sub["model"].astype(str).str.contains("OLS_HC3", na=False)
+        ].copy()
+
+    if "variable" in coef_sub.columns and "coef" in coef_sub.columns:
+        coef_sub = coef_sub[
+            coef_sub["variable"].astype(str).str.startswith("z_")
+        ].copy()
+
+        coef_sub["abs_coef"] = coef_sub["coef"].abs()
+        coef_sub = coef_sub.sort_values("abs_coef", ascending=False).head(5)
+
+        for _, row in coef_sub.iterrows():
+            var = str(row["variable"]).replace("z_", "")
+            p_value = row["p_value"] if "p_value" in row.index else np.nan
+
+            if pd.notna(p_value):
+                sig = "p ≤ 0.05" if p_value <= 0.05 else ("p ≤ 0.10" if p_value <= 0.10 else "n.s.")
+            else:
+                sig = "p unavailable"
+
+            direction = "▲" if row["coef"] > 0 else "▼"
+            driver_lines.append(f"  {direction} {var}   β = {row['coef']:.3f}   {sig}")
+
+# ------------------------------------------------------------
+# 8. Export synthesis products
+# ------------------------------------------------------------
+
+synthesis_gpkg = DIRS["processed"] / "nci_br_sjc_final_scientific_synthesis_map.gpkg"
+synthesis_csv = DIRS["tables"] / "nci_br_sjc_final_scientific_synthesis_table.csv"
+class_summary_csv = DIRS["tables"] / "nci_br_sjc_final_scientific_synthesis_class_summary.csv"
+
+analysis.to_file(
+    synthesis_gpkg,
+    layer="final_scientific_synthesis_sjc",
+    driver="GPKG",
+)
+
+synthesis_table.to_csv(
+    synthesis_csv,
+    index=False,
+    encoding="utf-8-sig",
+)
+
+class_summary.to_csv(
+    class_summary_csv,
+    index=False,
+    encoding="utf-8-sig",
+)
+
+print("\nData products exported:")
+print(f"  {synthesis_gpkg}")
+print(f"  {synthesis_csv}")
+print(f"  {class_summary_csv}")
+
+# ============================================================
+# 9. Helper functions
+# ============================================================
+
+def _apply_map_extent(ax):
+    ax.set_xlim(MAP_XLIM)
+    ax.set_ylim(MAP_YLIM)
+    ax.set_aspect("equal")
+
+
+def _apply_mask(ax):
+    mask_gdf.plot(
+        ax=ax,
+        color="white",
+        linewidth=0,
+        zorder=5,
+    )
+
+
+def _draw_boundary(ax, lw=1.5):
+    muni_boundary.boundary.plot(
+        ax=ax,
+        color="white",
+        linewidth=lw + 1.2,
+        zorder=6,
+        alpha=0.85,
+    )
+
+    muni_boundary.boundary.plot(
+        ax=ax,
+        color=PALETTE["boundary"],
+        linewidth=lw,
+        zorder=7,
+    )
+
+    for _, row in muni_indiv.iterrows():
+        centroid = row.geometry.representative_point()
+        ax.text(
+            centroid.x,
+            centroid.y,
+            row["name_muni"],
+            fontsize=6.2,
+            fontweight="bold",
+            color=PALETTE["boundary"],
+            ha="center",
+            va="center",
+            zorder=8,
+            bbox=dict(
+                facecolor="white",
+                edgecolor="none",
+                alpha=0.62,
+                boxstyle="round,pad=0.18",
+            ),
+        )
+
+
+def safe_choropleth(gdf, column, ax, cmap, title, unit_label=""):
+    ax.set_facecolor(PALETTE["na_color"])
+
+    if column not in gdf.columns:
+        valid = pd.Series(dtype=float)
+    else:
+        valid = pd.to_numeric(gdf[column], errors="coerce").dropna()
+
+    if valid.empty:
+        gdf.plot(
+            ax=ax,
+            color=PALETTE["na_color"],
+            linewidth=0,
+        )
+
+        ax.text(
+            0.5,
+            0.5,
+            f"No data\n({column})",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            fontsize=8,
+            color="#888888",
+            bbox=dict(
+                facecolor="white",
+                edgecolor="none",
+                alpha=0.75,
+                boxstyle="round,pad=0.4",
+            ),
+        )
+
+    else:
+        vmin = float(valid.min())
+        vmax = float(valid.max())
+
+        if vmin == vmax:
+            vmax = vmin + 1e-9
+
+        plot_gdf = gdf.copy()
+        plot_gdf["_v"] = pd.to_numeric(plot_gdf[column], errors="coerce")
+
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes("right", size="4%", pad=0.06)
+
+        plot_gdf.plot(
+            column="_v",
+            ax=ax,
+            cmap=cmap,
+            linewidth=0,
+            vmin=vmin,
+            vmax=vmax,
+            legend=True,
+            legend_kwds={
+                "cax": cax,
+                "orientation": "vertical",
+            },
+            missing_kwds={
+                "color": PALETTE["na_color"],
+                "label": "No data",
+            },
+        )
+
+        cax.tick_params(labelsize=6.5)
+
+        if unit_label:
+            cax.set_ylabel(
+                unit_label,
+                fontsize=6.2,
+                labelpad=3,
+            )
+
+    _apply_mask(ax)
+    _draw_boundary(ax)
+    _apply_map_extent(ax)
+
+    ax.set_title(
+        title,
+        fontsize=9,
+        fontweight="bold",
+        color=PALETTE["title_text"],
+        pad=4,
+        loc="center",
+    )
+
+    ax.set_axis_off()
+
+
+def add_panel_label(ax, label):
+    ax.text(
+        0.015,
+        0.975,
+        label,
+        transform=ax.transAxes,
+        fontsize=12,
+        fontweight="bold",
+        color="white",
+        va="top",
+        ha="left",
+        bbox=dict(
+            facecolor="#1A3A5C",
+            edgecolor="none",
+            alpha=0.88,
+            boxstyle="round,pad=0.28",
+        ),
+        zorder=20,
+    )
+
+# ============================================================
+# 10. Composite figure — no standalone table inside maps
+# ============================================================
+
+fig = plt.figure(figsize=(20, 13), dpi=FIG_DPI)
+fig.patch.set_facecolor(PALETTE["background"])
+
+gs_main = gridspec.GridSpec(
+    nrows=3,
+    ncols=4,
+    figure=fig,
+    width_ratios=[1, 1, 1, 1],
+    height_ratios=[1, 1, 0.72],
+    left=0.03,
+    right=0.97,
+    top=0.91,
+    bottom=0.04,
+    wspace=0.30,
+    hspace=0.32,
+)
+
+ax_a = fig.add_subplot(gs_main[0, 0])
+ax_b = fig.add_subplot(gs_main[0, 1])
+ax_c = fig.add_subplot(gs_main[0, 2])
+ax_d = fig.add_subplot(gs_main[0, 3])
+
+ax_e = fig.add_subplot(gs_main[1, 0])
+ax_f = fig.add_subplot(gs_main[1, 1])
+ax_g = fig.add_subplot(gs_main[1, 2])
+ax_h = fig.add_subplot(gs_main[1, 3])
+
+ax_i = fig.add_subplot(gs_main[2, 0:2])
+ax_j = fig.add_subplot(gs_main[2, 2:4])
+
+# Panel a
+safe_choropleth(
+    analysis,
+    "NCI_BR",
+    ax_a,
+    "YlGn",
+    "Natural Capital Index — NCI-BR",
+    unit_label="NCI score",
+)
+add_panel_label(ax_a, "a")
+
+# Panel b
+safe_choropleth(
+    analysis,
+    new_urban_col,
+    ax_b,
+    "YlOrRd",
+    f"Observed urban/infrastructure expansion\n{REF_YEAR}–{TARGET_YEAR}",
+    unit_label="ha",
+)
+add_panel_label(ax_b, "b")
+
+# Panel c
+safe_choropleth(
+    analysis,
+    native_to_urban_col,
+    ax_c,
+    "OrRd",
+    f"Native vegetation converted to urban\n{REF_YEAR}–{TARGET_YEAR}",
+    unit_label="ha",
+)
+add_panel_label(ax_c, "c")
+
+# Panel d
+safe_choropleth(
+    analysis,
+    nci_exposed_col,
+    ax_d,
+    "RdPu",
+    "Natural-capital exposure from\nobserved conversion",
+    unit_label="NCI × ha",
+)
+add_panel_label(ax_d, "d")
+
+# Panel e
+safe_choropleth(
+    analysis,
+    "prob_high_nci_q75",
+    ax_e,
+    "YlGnBu",
+    "Robustness of high-NCI classification\nMonte Carlo probability",
+    unit_label="prob.",
+)
+add_panel_label(ax_e, "e")
+
+# Panel f
+safe_choropleth(
+    analysis,
+    "urban_conversion_inside_floodplain",
+    ax_f,
+    "Blues",
+    "Observed urban conversion\ninside floodplain",
+    unit_label="ha",
+)
+add_panel_label(ax_f, "f")
+
+# Panel g
+safe_choropleth(
+    analysis,
+    "connectivity_conservation_score",
+    ax_g,
+    "Greens",
+    "Connectivity conservation score",
+    unit_label="0–100",
+)
+add_panel_label(ax_g, "g")
+
+# Panel h — categorical evidence classes
+ax_h.set_facecolor(PALETTE["na_color"])
+
+analysis["_cls_color"] = analysis["final_evidence_class"].map(CLASS_COLORS)
+
+analysis.plot(
+    ax=ax_h,
+    color=analysis["_cls_color"].fillna(PALETTE["na_color"]),
+    linewidth=0,
+)
+
+_apply_mask(ax_h)
+_draw_boundary(ax_h)
+_apply_map_extent(ax_h)
+
+ax_h.set_title(
+    "Final evidence classes",
+    fontsize=9,
+    fontweight="bold",
+    color=PALETTE["title_text"],
+    pad=4,
+)
+
+ax_h.set_axis_off()
+
+handles = [
+    mpatches.Patch(
+        facecolor=color,
+        edgecolor="none",
+        label=label,
+    )
+    for label, color in CLASS_COLORS.items()
+    if label in analysis["final_evidence_class"].unique()
+]
+
+ax_h.legend(
+    handles=handles,
+    loc="lower left",
+    fontsize=6.2,
+    frameon=True,
+    framealpha=0.92,
+    edgecolor="#cccccc",
+    handlelength=1.4,
+    handleheight=1.1,
+    borderpad=0.6,
+)
+
+add_panel_label(ax_h, "h")
+
+# Panel i — key statistics
+ax_i.set_facecolor("#F0F4F8")
+ax_i.set_xlim(0, 1)
+ax_i.set_ylim(0, 1)
+ax_i.set_axis_off()
+
+ax_i.text(
+    0.03,
+    0.94,
+    f"Key project metrics — {MUNICIPALITY}",
+    transform=ax_i.transAxes,
+    fontsize=9,
+    fontweight="bold",
+    color=PALETTE["title_text"],
+    va="top",
+)
+
+stat_lines = [
+    ("Analysed municipal area", f"{grid_area_ha:,.0f} ha", "clipped grid"),
+    ("New urban/infra. area", f"{total_new_urban:,.0f} ha", f"{REF_YEAR}–{TARGET_YEAR}"),
+    ("Native vegetation converted", f"{total_native_to_urban:,.0f} ha", f"{REF_YEAR}–{TARGET_YEAR}"),
+    ("NCI-BR exposure", f"{total_nci_exposed:,.0f} NCI×ha", "area-weighted"),
+    ("Urban expansion in high-NCI cells", f"{converted_high_nci_ha:,.0f} ha", "≥ Q75 NCI"),
+    ("Native conversion in high-NCI cells", f"{native_converted_high_nci_ha:,.2f} ha", "≥ Q75 NCI"),
+    ("Robust high-NCI cells", f"{robust_high_nci_cells:,}", "≥75% MC resamples"),
+    (
+        "Urban conversion in floodplain",
+        f"{urban_inside_floodplain:,.0f} ha" if pd.notna(urban_inside_floodplain) else "NA",
+        "HAND/floodplain proxy",
+    ),
+]
+
+col_x = [0.03, 0.55, 0.82]
+row_h = 0.108
+y0 = 0.81
+
+for x, hdr in zip(col_x, ["Metric", "Value", "Context"]):
+    ax_i.text(
+        x,
+        y0 + 0.01,
+        hdr,
+        transform=ax_i.transAxes,
+        fontsize=7.5,
+        fontweight="bold",
+        color=PALETTE["header_bg"],
+        va="top",
+    )
+
+ax_i.plot(
+    [0.02, 0.98],
+    [y0 - 0.005, y0 - 0.005],
+    linewidth=0.8,
+    color=PALETTE["panel_border"],
+    transform=ax_i.transAxes,
+    clip_on=False,
+)
+
+for k, (metric, value, context) in enumerate(stat_lines):
+    y = y0 - row_h * (k + 1) + 0.01
+
+    if k % 2 == 0:
+        ax_i.axhspan(
+            y - 0.024,
+            y + 0.066,
+            xmin=0.01,
+            xmax=0.99,
+            facecolor=PALETTE["row_odd"],
+            alpha=0.7,
+            zorder=0,
+        )
+
+    ax_i.text(
+        col_x[0],
+        y,
+        metric,
+        transform=ax_i.transAxes,
+        fontsize=7.2,
+        va="top",
+        color=PALETTE["body_text"],
+    )
+
+    ax_i.text(
+        col_x[1],
+        y,
+        value,
+        transform=ax_i.transAxes,
+        fontsize=7.4,
+        va="top",
+        color=PALETTE["title_text"],
+        fontweight="bold",
+    )
+
+    ax_i.text(
+        col_x[2],
+        y,
+        context,
+        transform=ax_i.transAxes,
+        fontsize=6.8,
+        va="top",
+        color="#777777",
+        style="italic",
+    )
+
+for spine in ax_i.spines.values():
+    spine.set_visible(True)
+    spine.set_edgecolor(PALETTE["panel_border"])
+    spine.set_linewidth(0.7)
+
+add_panel_label(ax_i, "i")
+
+# Panel j — integrated interpretation
+ax_j.set_facecolor("#F0F4F8")
+ax_j.set_xlim(0, 1)
+ax_j.set_ylim(0, 1)
+ax_j.set_axis_off()
+
+ax_j.text(
+    0.03,
+    0.94,
+    "Integrated interpretation",
+    transform=ax_j.transAxes,
+    fontsize=9,
+    fontweight="bold",
+    color=PALETTE["title_text"],
+    va="top",
+)
+
+interp_blocks = []
+
+if regression_panel_text:
+    interp_blocks.append(regression_panel_text)
+
+if driver_lines:
+    interp_blocks.append(
+        "Principal drivers of NCI-BR, OLS-HC3 standardised coefficients:\n"
+        + "\n".join(driver_lines)
+    )
+
+interp_blocks.append(
+    "Natural-capital exposure is concentrated where observed urban/infrastructure "
+    "expansion coincides with high NCI-BR values, native-vegetation conversion, "
+    "floodplain occupation, or robust high-NCI classifications. These cells define "
+    f"the highest-priority intervention zones in {MUNICIPALITY}."
+)
+
+ax_j.text(
+    0.03,
+    0.80,
+    "\n\n".join(interp_blocks),
+    transform=ax_j.transAxes,
+    fontsize=7.8,
+    va="top",
+    ha="left",
+    linespacing=1.55,
+    color=PALETTE["body_text"],
+    wrap=True,
+)
+
+for spine in ax_j.spines.values():
+    spine.set_visible(True)
+    spine.set_edgecolor(PALETTE["panel_border"])
+    spine.set_linewidth(0.7)
+
+add_panel_label(ax_j, "j")
+
+fig.suptitle(
+    "Observed natural-capital exposure from urban expansion\n"
+    f"{MUNICIPALITY} — Brazil NCI-BR pilot",
+    fontsize=15,
+    fontweight="bold",
+    color=PALETTE["title_text"],
+    y=0.970,
+)
+
+fig.text(
+    0.03,
+    0.012,
+    "All results are derived from observed datasets: MapBiomas land-cover transitions, "
+    "Landsat vegetation condition, MERIT Hydro HAND, JRC surface water, spatial "
+    "regression diagnostics, fragmentation/connectivity metrics, and Monte Carlo "
+    f"weight-sensitivity analysis. Spatial extent: {MUNICIPALITY}, SP, clipped to the "
+    "official municipal boundary. No synthetic footprints or hypothetical scenarios.",
+    fontsize=6.5,
+    color="#666666",
+    style="italic",
+)
+
+fig_png = DIRS["figures"] / "figure_16_nci_br_sjc_final_scientific_synthesis.png"
+fig_pdf = DIRS["figures"] / "figure_16_nci_br_sjc_final_scientific_synthesis.pdf"
+
+plt.savefig(
+    fig_png,
+    dpi=FIG_DPI,
+    bbox_inches="tight",
+    facecolor=fig.get_facecolor(),
+)
+
+plt.savefig(
+    fig_pdf,
+    dpi=FIG_DPI,
+    bbox_inches="tight",
+    facecolor=fig.get_facecolor(),
+)
+
+plt.show()
+
+print(f"\nComposite figure exported:\n  {fig_png}\n  {fig_pdf}")
+
+# ============================================================
+# 11. Standalone publication-ready summary table
+# ============================================================
+
+fig_t, ax_t = plt.subplots(figsize=(12, 4.9), dpi=FIG_DPI)
+fig_t.patch.set_facecolor("white")
+ax_t.set_facecolor("white")
+ax_t.set_axis_off()
+
+tbl_data = synthesis_table[["Metric", "Value", "Unit"]].values
+col_labels = ["Project answer metric", "Value", "Unit"]
+col_widths = [0.62, 0.20, 0.18]
+
+table = ax_t.table(
+    cellText=tbl_data,
+    colLabels=col_labels,
+    loc="center",
+    cellLoc="left",
+    colLoc="left",
+    colWidths=col_widths,
+)
+
+table.auto_set_font_size(False)
+table.set_fontsize(8.6)
+table.scale(1.0, 1.85)
+
+for (row, col), cell in table.get_celld().items():
+    cell.set_edgecolor("#D8D8D8")
+    cell.set_linewidth(0.5)
+    cell.PAD = 0.06
+
+    if row == 0:
+        cell.set_facecolor(PALETTE["header_bg"])
+        cell.set_text_props(
+            color="white",
+            fontweight="bold",
+            fontsize=8.8,
+        )
+
+    elif row % 2 == 1:
+        cell.set_facecolor(PALETTE["row_odd"])
+        cell.set_text_props(
+            color=PALETTE["body_text"],
+            fontsize=8.5,
+        )
+
+    else:
+        cell.set_facecolor(PALETTE["row_even"])
+        cell.set_text_props(
+            color=PALETTE["body_text"],
+            fontsize=8.5,
+        )
+
+    if col == 1 and row > 0:
+        cell.set_text_props(
+            fontweight="bold",
+            color=PALETTE["title_text"],
+        )
+
+ax_t.set_title(
+    f"Observed natural-capital exposure — NCI-BR project summary table\n"
+    f"{MUNICIPALITY}  |  Reference period {REF_YEAR}–{TARGET_YEAR}",
+    fontsize=11,
+    fontweight="bold",
+    color=PALETTE["title_text"],
+    pad=14,
+    loc="left",
+)
+
+fig_t.text(
+    0.03,
+    0.03,
+    "Derived from observed MapBiomas, Landsat, MERIT Hydro HAND, and JRC datasets only. "
+    f"Spatial extent clipped to {MUNICIPALITY}, SP. No synthetic footprints.",
+    fontsize=7.5,
+    color="#888888",
+    style="italic",
+)
+
+tbl_png = DIRS["figures"] / "table_02_nci_br_sjc_final_scientific_synthesis_summary.png"
+tbl_pdf = DIRS["figures"] / "table_02_nci_br_sjc_final_scientific_synthesis_summary.pdf"
+
+plt.savefig(
+    tbl_png,
+    dpi=FIG_DPI,
+    bbox_inches="tight",
+    facecolor="white",
+)
+
+plt.savefig(
+    tbl_pdf,
+    dpi=FIG_DPI,
+    bbox_inches="tight",
+    facecolor="white",
+)
+
+plt.show()
+
+print(f"\nStandalone table exported:\n  {tbl_png}\n  {tbl_pdf}")
+
+# ============================================================
+# 12. Metadata
+# ============================================================
+
+block16_metadata = {
+    "block": "16",
+    "version": "sjc_final_complete",
+    "description": (
+        "Final scientific synthesis clipped to São José dos Campos only, "
+        "with high-quality composite figure and standalone table."
+    ),
+    "municipality": MUNICIPALITY,
+    "ibge_code": MUNI_CODE,
+    "boundary_source": str(muni_path),
+    "data_status": "Observed data only. No synthetic footprints. No hypothetical scenarios.",
+    "reference_year": REF_YEAR,
+    "target_year": TARGET_YEAR,
+    "n_cells_after_clip": int(len(analysis)),
+    "area_ha_after_clip": float(grid_area_ha),
+    "inputs": {
+        "synthesis": str(synthesis_path),
+        "uncertainty": str(uncertainty_path),
+        "fragmentation": str(fragmentation_path),
+        "floodplain": str(floodplain_path),
+    },
+    "outputs": {
+        "synthesis_map": str(synthesis_gpkg),
+        "synthesis_table": str(synthesis_csv),
+        "class_summary": str(class_summary_csv),
+        "figure_png": str(fig_png),
+        "figure_pdf": str(fig_pdf),
+        "table_png": str(tbl_png),
+        "table_pdf": str(tbl_pdf),
+    },
+    "created_at": datetime.now().isoformat(),
+}
+
+metadata_path = DIRS["metadata"] / "nci_br_block16_sjc_final_scientific_synthesis_metadata.json"
+
+with open(metadata_path, "w", encoding="utf-8") as f:
+    json.dump(
+        block16_metadata,
+        f,
+        indent=4,
+        ensure_ascii=False,
+    )
+
+print(f"\nMetadata saved at: {metadata_path}")
+
+logger.info("Block 16 completed successfully.")
+
+print("\n" + "=" * 72)
+print(f"BLOCK 16 — COMPLETED | {MUNICIPALITY}")
+print("=" * 72)
+print(f"  Grid cells after clip : {len(analysis)}")
+print(f"  Analysed area         : {grid_area_ha:,.2f} ha")
+print(f"  New urban area        : {total_new_urban:,.2f} ha")
+print(f"  Native converted      : {total_native_to_urban:,.2f} ha")
+print(f"  NCI exposure          : {total_nci_exposed:,.2f} NCI × ha")
+print(f"  Robust high-NCI cells : {robust_high_nci_cells}")
+print("=" * 72)
+print("\nOutputs: composite figure + standalone table + SJC synthesis files.")
