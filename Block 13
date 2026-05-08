@@ -1,0 +1,672 @@
+# ============================================================
+# BRAZIL NCI-BR PROJECT
+# BLOCK 13 — FLOODPLAIN OCCUPATION DIAGNOSTICS
+# REAL DATA ONLY — NO SYNTHETIC SCENARIOS
+# FOCUS: SÃO JOSÉ DOS CAMPOS — SP, BRAZIL
+# ============================================================
+#
+# Boundary pattern: identical to Block 03 section 4.
+#   muni_path = DIRS["processed"] / "nci_br_sjc_municipality.gpkg"
+#   muni_gdf  = gpd.read_file(muni_path)
+#   muni_plot = muni_gdf.to_crs(plot_crs)
+#   map_extent from muni_plot.total_bounds
+# If nci_br_sjc_municipality.gpkg does not exist, it is downloaded
+# from the IBGE API and saved — same as corrected Block 02 / 12.
+# ============================================================
+
+import io
+import json
+import logging
+import hashlib
+import requests
+from pathlib import Path
+from datetime import datetime
+
+import ee
+import geemap
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+
+# ------------------------------------------------------------
+# 1. Reload project configuration
+# ------------------------------------------------------------
+
+PROJECT_ROOT = Path("/content/drive/MyDrive/Brazil/NCI_BR_Project")
+
+DIRS = {
+    "root":         PROJECT_ROOT,
+    "raw":          PROJECT_ROOT / "01_raw",
+    "intermediate": PROJECT_ROOT / "02_intermediate",
+    "processed":    PROJECT_ROOT / "03_processed",
+    "tables":       PROJECT_ROOT / "04_tables",
+    "figures":      PROJECT_ROOT / "05_figures",
+    "maps":         PROJECT_ROOT / "06_maps",
+    "exports":      PROJECT_ROOT / "07_exports",
+    "logs":         PROJECT_ROOT / "08_logs",
+    "metadata":     PROJECT_ROOT / "09_metadata",
+}
+for d in DIRS.values():
+    d.mkdir(parents=True, exist_ok=True)
+
+config_path = DIRS["metadata"] / "nci_br_config.json"
+with open(config_path, "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
+
+plot_crs     = CONFIG.get("output_crs", "EPSG:5880")
+MUNICIPALITY = "São José dos Campos"
+TARGET_YEAR  = int(CONFIG["baseline_year"])
+REF_YEAR     = 1985
+
+# ------------------------------------------------------------
+# 2. Logging
+# ------------------------------------------------------------
+
+log_file = DIRS["logs"] / f"nci_br_block13_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+logging.basicConfig(
+    filename=log_file, level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger("NCI_BR_BLOCK13")
+logger.info(f"Block 13 started — {MUNICIPALITY}.")
+print(f"Log file: {log_file}")
+
+# ------------------------------------------------------------
+# 3. Earth Engine initialization
+# ------------------------------------------------------------
+
+try:
+    ee.Initialize(project=CONFIG["gee_project_id"])
+    print("Google Earth Engine initialized.")
+except Exception:
+    ee.Authenticate()
+    ee.Initialize(project=CONFIG["gee_project_id"])
+    print("Google Earth Engine initialized after authentication.")
+
+# ------------------------------------------------------------
+# 4. Load SJC boundary — EXACT SAME PATTERN AS BLOCK 03
+# ------------------------------------------------------------
+
+muni_path = DIRS["processed"] / "nci_br_sjc_municipality.gpkg"
+
+if not muni_path.exists():
+    print("nci_br_sjc_municipality.gpkg not found.")
+    print("Downloading real SJC boundary from IBGE API (code 3549904)...")
+    url = ("https://servicodados.ibge.gov.br/api/v3/malhas/municipios"
+           "/3549904?formato=application/json&qualidade=maxima")
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    muni_gdf = gpd.read_file(io.BytesIO(resp.content))
+    muni_gdf = muni_gdf.set_crs("EPSG:4326").to_crs("EPSG:4674")
+    muni_gdf["NM_MUN"]   = MUNICIPALITY
+    muni_gdf["CD_MUN"]   = "3549904"
+    muni_gdf["SIGLA_UF"] = "SP"
+    muni_gdf.to_file(muni_path, driver="GPKG")
+    print(f"  Saved to: {muni_path.name}")
+else:
+    muni_gdf = gpd.read_file(muni_path)
+    print(f"Municipal boundary loaded: {muni_path.name}")
+
+if muni_gdf.crs is None:
+    muni_gdf = muni_gdf.set_crs("EPSG:4674")
+
+muni_plot = muni_gdf.to_crs(plot_crs)
+
+xmin, ymin, xmax, ymax = muni_plot.total_bounds
+xbuf = (xmax - xmin) * 0.05
+ybuf = (ymax - ymin) * 0.05
+map_extent = [xmin - xbuf, xmax + xbuf, ymin - ybuf, ymax + ybuf]
+
+# GEE geometry — real SJC polygon (not bounding box)
+muni_ee  = geemap.geopandas_to_ee(muni_gdf.to_crs("EPSG:4326"))
+aoi_geom = muni_ee.geometry()
+
+print(f"Municipality : {MUNICIPALITY}")
+print(f"Map extent   : {xmin:.0f}, {ymin:.0f} → {xmax:.0f}, {ymax:.0f}")
+
+# ------------------------------------------------------------
+# 5. Helper functions
+# ------------------------------------------------------------
+
+def clip_image_to_aoi(image: ee.Image, geom: ee.Geometry) -> ee.Image:
+    return (image.clip(geom)
+            .updateMask(ee.Image.constant(1).clip(geom).unmask(0)))
+
+
+def area_band(mask: ee.Image, name: str) -> ee.Image:
+    return ee.Image.pixelArea().divide(1e4).updateMask(mask).rename(name)
+
+
+def find_col(df, candidates, required=True):
+    for c in candidates:
+        if c in df.columns:
+            return c
+    if required:
+        raise ValueError(f"None of these columns found: {candidates}")
+    return None
+
+
+def md5_checksum(fp: Path) -> str:
+    h = hashlib.md5()
+    with open(fp, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+# ------------------------------------------------------------
+# 6. Load observed conversion and clip to real SJC polygon
+# ------------------------------------------------------------
+
+CANDIDATE_INPUTS = [
+    DIRS["processed"] / "nci_br_sjc_evidence_synthesis.gpkg",
+    DIRS["processed"] / "nci_br_sjc_observed_conversion.gpkg",
+    DIRS["processed"] / "nci_br_real_data_evidence_synthesis_map.gpkg",
+    DIRS["processed"] / "nci_br_observed_urban_conversion_accounting.gpkg",
+]
+input_path = next((p for p in CANDIDATE_INPUTS if p.exists()), None)
+if input_path is None:
+    raise FileNotFoundError(
+        "No observed conversion dataset found. Tried:\n" +
+        "\n".join(f"  {p}" for p in CANDIDATE_INPUTS)
+    )
+print(f"\nUsing input: {input_path.name}")
+
+gdf = gpd.read_file(input_path)
+if gdf.crs is None:
+    gdf = gdf.set_crs(plot_crs)
+gdf = gdf.to_crs(plot_crs)
+
+# Clip to real SJC polygon — same pattern as Block 03
+n_before = len(gdf)
+gdf = gpd.clip(gdf, muni_plot).copy().reset_index(drop=True)
+print(f"Clip to SJC  : {n_before} → {len(gdf)} cells "
+      f"({n_before - len(gdf)} outside SJC removed)")
+
+# Guard grid_area_ha
+if "grid_area_ha" not in gdf.columns or gdf["grid_area_ha"].isna().all():
+    gdf["grid_area_ha"] = gdf.geometry.area / 1e4
+else:
+    gdf["grid_area_ha"] = pd.to_numeric(gdf["grid_area_ha"], errors="coerce")
+    bad = gdf["grid_area_ha"].isna() | (gdf["grid_area_ha"] <= 0)
+    if bad.any():
+        gdf.loc[bad, "grid_area_ha"] = gdf.loc[bad].geometry.area / 1e4
+
+print(f"Observed cells: {len(gdf)}")
+
+# Detect response columns
+urban_col = find_col(gdf, [
+    f"new_urban_{REF_YEAR}_{TARGET_YEAR}_ha",
+    f"observed_new_urban_{REF_YEAR}_{TARGET_YEAR}_ha",
+])
+native_col = find_col(gdf, [f"native_to_urban_{REF_YEAR}_{TARGET_YEAR}_ha"])
+
+for col in [urban_col, native_col, "NCI_BR", "grid_area_ha"]:
+    gdf[col] = pd.to_numeric(gdf[col], errors="coerce").fillna(0)
+
+print(f"Urban column : {urban_col}")
+print(f"Native column: {native_col}")
+
+# ------------------------------------------------------------
+# 7. Load SJC grid and clip to municipality
+# ------------------------------------------------------------
+
+CANDIDATE_GRIDS = [
+    DIRS["processed"] / "nci_br_sjc_grid_1km.gpkg",
+    DIRS["processed"] / "nci_br_pilot_grid_1km.gpkg",
+]
+grid_path = next((p for p in CANDIDATE_GRIDS if p.exists()), None)
+if grid_path is None:
+    raise FileNotFoundError("Grid file not found. Run Block 02 first.")
+
+grid_gdf = gpd.read_file(grid_path)
+if grid_gdf.crs is None:
+    grid_gdf = grid_gdf.set_crs(plot_crs)
+grid_gdf = grid_gdf.to_crs(plot_crs)
+
+# Clip grid to real SJC polygon
+grid_gdf = gpd.clip(grid_gdf, muni_plot).reset_index(drop=True)
+grid_ee  = geemap.geopandas_to_ee(grid_gdf.to_crs("EPSG:4326"))
+print(f"Grid cells (SJC only): {len(grid_gdf)}")
+
+# ------------------------------------------------------------
+# 8. MERIT Hydro HAND — clipped to real SJC boundary
+# ------------------------------------------------------------
+
+hand = clip_image_to_aoi(
+    ee.Image("MERIT/Hydro/v1_0_1").select("hnd"), aoi_geom
+)
+
+fp_lte5  = hand.lte(5)
+fp_5_10  = hand.gt(5).And(hand.lte(10))
+fp_10_20 = hand.gt(10).And(hand.lte(20))
+upland   = hand.gt(20)
+fp_total = hand.lte(10)   # main floodplain definition
+
+hand_stack = ee.Image.cat([
+    hand.rename("HAND"),
+    area_band(fp_lte5,  "fp_0_5_ha"),
+    area_band(fp_5_10,  "fp_5_10_ha"),
+    area_band(fp_10_20, "fp_10_20_ha"),
+    area_band(upland,   "upland_gt20_ha"),
+    area_band(fp_total, "fp_total_ha"),
+])
+
+# ------------------------------------------------------------
+# 9. Extract HAND metrics per 1-km grid cell
+# ------------------------------------------------------------
+
+print("\nExtracting HAND and floodplain metrics per 1-km cell...")
+
+hand_fc  = hand_stack.reduceRegions(
+    collection=grid_ee,
+    reducer=ee.Reducer.mean().combine(ee.Reducer.sum(), sharedInputs=True),
+    scale=90,
+    tileScale=4
+)
+
+hand_gdf = geemap.ee_to_gdf(hand_fc)
+if hand_gdf.crs is None:
+    hand_gdf = hand_gdf.set_crs("EPSG:4326")
+
+if "grid_id" not in hand_gdf.columns:
+    hand_gdf["grid_id"] = hand_gdf.index.astype(int)
+
+# ------------------------------------------------------------
+# 10. Merge HAND metrics with observed conversion
+# ------------------------------------------------------------
+
+hand_table   = pd.DataFrame(hand_gdf.drop(columns="geometry", errors="ignore"))
+analysis_gdf = gdf.merge(hand_table, on="grid_id", how="left", suffixes=("", "_hand"))
+
+# Resolve HAND column names
+hand_col     = find_col(analysis_gdf, ["HAND_mean", "HAND", "hnd_mean"])
+fp_total_col = find_col(analysis_gdf, ["fp_total_ha_sum",   "fp_total_ha",   "fp_total_ha_mean"])
+fp_0_5_col   = find_col(analysis_gdf, ["fp_0_5_ha_sum",     "fp_0_5_ha",     "fp_0_5_ha_mean"])
+fp_5_10_col  = find_col(analysis_gdf, ["fp_5_10_ha_sum",    "fp_5_10_ha",    "fp_5_10_ha_mean"])
+fp_10_20_col = find_col(analysis_gdf, ["fp_10_20_ha_sum",   "fp_10_20_ha",   "fp_10_20_ha_mean"])
+upland_col   = find_col(analysis_gdf, ["upland_gt20_ha_sum","upland_gt20_ha","upland_gt20_ha_mean"])
+
+print(f"\nHAND columns resolved:")
+for lbl, col in [("HAND",      hand_col), ("FP total", fp_total_col),
+                  ("FP 0–5",   fp_0_5_col), ("FP 5–10", fp_5_10_col),
+                  ("FP 10–20", fp_10_20_col), (">20 m",  upland_col)]:
+    print(f"  {lbl:<10}: {col}")
+
+for col in [hand_col, fp_total_col, fp_0_5_col, fp_5_10_col, fp_10_20_col, upland_col]:
+    analysis_gdf[col] = pd.to_numeric(analysis_gdf[col], errors="coerce").fillna(0)
+
+# ------------------------------------------------------------
+# 11. Floodplain occupation indicators
+# ------------------------------------------------------------
+
+analysis_gdf["floodplain_fraction"] = (
+    analysis_gdf[fp_total_col] / analysis_gdf["grid_area_ha"]
+).clip(0, 1)
+
+analysis_gdf["urban_in_fp_ha"]  = analysis_gdf[urban_col]  * analysis_gdf["floodplain_fraction"]
+analysis_gdf["native_in_fp_ha"] = analysis_gdf[native_col] * analysis_gdf["floodplain_fraction"]
+analysis_gdf["NCI_exp_in_fp"]   = analysis_gdf["urban_in_fp_ha"] * analysis_gdf["NCI_BR"]
+
+# Floodplain exposure class
+CLASS_ORDER = ["Very high (≥75 %)", "High (50–75 %)", "Moderate (25–50 %)", "Low (<25 %)"]
+CLASS_COLORS = {
+    "Very high (≥75 %)": "#08306b",
+    "High (50–75 %)":    "#2171b5",
+    "Moderate (25–50 %)":"#6baed6",
+    "Low (<25 %)":       "#deebf7",
+}
+
+def classify_fp(frac):
+    if frac >= 0.75: return "Very high (≥75 %)"
+    if frac >= 0.50: return "High (50–75 %)"
+    if frac >= 0.25: return "Moderate (25–50 %)"
+    return "Low (<25 %)"
+
+analysis_gdf["fp_class"] = analysis_gdf["floodplain_fraction"].apply(classify_fp)
+
+# ------------------------------------------------------------
+# 12. Summary statistics
+# ------------------------------------------------------------
+
+tot_urban  = float(analysis_gdf[urban_col].sum())
+tot_native = float(analysis_gdf[native_col].sum())
+tot_urb_fp = float(analysis_gdf["urban_in_fp_ha"].sum())
+tot_nat_fp = float(analysis_gdf["native_in_fp_ha"].sum())
+tot_nci_fp = float(analysis_gdf["NCI_exp_in_fp"].sum())
+mean_nci_fp50 = float(analysis_gdf.loc[analysis_gdf["floodplain_fraction"] >= 0.5, "NCI_BR"].mean())
+
+summary_df = pd.DataFrame([
+    ("Urban conversion inside floodplain (HAND ≤ 10 m)", tot_urb_fp, "ha"),
+    ("Native-to-urban conversion inside floodplain",      tot_nat_fp, "ha"),
+    ("% urban conversion inside floodplain",
+     tot_urb_fp / tot_urban * 100 if tot_urban > 0 else np.nan, "%"),
+    ("% native conversion inside floodplain",
+     tot_nat_fp / tot_native * 100 if tot_native > 0 else np.nan, "%"),
+    ("Area-weighted NCI exposure inside floodplain",      tot_nci_fp, "NCI × ha"),
+    ("Mean NCI-BR in high-floodplain cells (≥50 %)",      mean_nci_fp50, "0–100"),
+], columns=["metric", "value", "unit"])
+
+grouped_df = (
+    analysis_gdf.groupby("fp_class")
+    .agg(
+        n_cells=("grid_id",             "count"),
+        mean_NCI_BR=("NCI_BR",           "mean"),
+        mean_fp_frac=("floodplain_fraction","mean"),
+        urban_conv_ha=(urban_col,         "sum"),
+        native_conv_ha=(native_col,       "sum"),
+        urban_in_fp_ha=("urban_in_fp_ha", "sum"),
+        NCI_exp_in_fp=("NCI_exp_in_fp",   "sum"),
+        mean_HAND=(hand_col,              "mean"),
+    )
+    .reset_index()
+    .sort_values("mean_fp_frac", ascending=False)
+)
+
+# ------------------------------------------------------------
+# 13. Export products
+# ------------------------------------------------------------
+
+diag_gpkg    = DIRS["processed"] / "nci_br_sjc_floodplain_diagnostics.gpkg"
+diag_csv     = DIRS["tables"]    / "nci_br_sjc_floodplain_diagnostics.csv"
+summary_path = DIRS["tables"]    / "nci_br_sjc_floodplain_summary.csv"
+grouped_path = DIRS["tables"]    / "nci_br_sjc_floodplain_grouped.csv"
+
+analysis_gdf.to_file(diag_gpkg, layer="floodplain_diagnostics", driver="GPKG")
+pd.DataFrame(analysis_gdf.drop(columns="geometry", errors="ignore")).to_csv(
+    diag_csv, index=False, encoding="utf-8-sig"
+)
+summary_df.to_csv(summary_path, index=False, encoding="utf-8-sig")
+grouped_df.to_csv(grouped_path, index=False, encoding="utf-8-sig")
+
+print(f"\nOutputs exported:")
+for p in [diag_gpkg, diag_csv, summary_path, grouped_path]:
+    print(f"  {p}")
+logger.info(f"Outputs exported. n={len(analysis_gdf)} cells")
+
+# ------------------------------------------------------------
+# 14. Cartographic helpers — IDENTICAL to Block 03
+# ------------------------------------------------------------
+
+def add_panel_label(ax, label):
+    ax.text(0.02, 0.97, label, transform=ax.transAxes,
+            fontsize=12, fontweight="bold", va="top", ha="left",
+            bbox=dict(facecolor="white", edgecolor="none",
+                      alpha=0.88, boxstyle="round,pad=0.22"))
+
+def overlay_boundary(ax, gdf):
+    """Overlay municipal boundary on any map panel."""
+    gdf.boundary.plot(ax=ax, edgecolor="black", linewidth=1.2, zorder=5)
+
+# Project for plotting
+plot_gdf = analysis_gdf.to_crs(plot_crs)
+
+# ------------------------------------------------------------
+# 15. Figure — 9 panels using Block 03 map pattern exactly
+# ------------------------------------------------------------
+
+plt.rcParams.update({
+    "figure.dpi": 150, "savefig.dpi": CONFIG["figure_dpi"],
+    "font.family": "DejaVu Sans", "font.size": 9.5,
+    "axes.titlesize": 10, "axes.labelsize": 9,
+    "legend.fontsize": 8.5, "axes.linewidth": 0.7,
+    "pdf.fonttype": 42, "ps.fonttype": 42, "savefig.bbox": "tight",
+})
+
+fig = plt.figure(figsize=(16, 11), dpi=150)
+gs  = fig.add_gridspec(
+    nrows=3, ncols=3,
+    width_ratios=[1.2, 1.2, 1.0],
+    height_ratios=[1, 1, 1],
+    wspace=0.22, hspace=0.32
+)
+ax_a = fig.add_subplot(gs[0, 0])
+ax_b = fig.add_subplot(gs[0, 1])
+ax_c = fig.add_subplot(gs[0, 2])
+ax_d = fig.add_subplot(gs[1, 0])
+ax_e = fig.add_subplot(gs[1, 1])
+ax_f = fig.add_subplot(gs[1, 2])
+ax_g = fig.add_subplot(gs[2, 0])
+ax_h = fig.add_subplot(gs[2, 1])
+ax_i = fig.add_subplot(gs[2, 2])
+
+# ── Panel a — HAND map ────────────────────────────────────────
+plot_gdf.plot(
+    column=hand_col, ax=ax_a,
+    cmap="Blues_r", linewidth=0.0, legend=True,
+    legend_kwds={"label": "Mean HAND (m)", "shrink": 0.7},
+    missing_kwds={"color": "lightgrey"}
+)
+overlay_boundary(ax_a, muni_plot)
+ax_a.set_xlim(map_extent[0], map_extent[1])
+ax_a.set_ylim(map_extent[2], map_extent[3])
+ax_a.set_title("Mean HAND per 1-km cell", loc="left")
+ax_a.set_axis_off()
+add_panel_label(ax_a, "a")
+
+# ── Panel b — Floodplain fraction map ────────────────────────
+plot_gdf.plot(
+    column="floodplain_fraction", ax=ax_b,
+    cmap="PuBu", linewidth=0.0, legend=True,
+    legend_kwds={"label": "Floodplain fraction (0–1)", "shrink": 0.7},
+    missing_kwds={"color": "lightgrey"}, vmin=0, vmax=1
+)
+overlay_boundary(ax_b, muni_plot)
+ax_b.set_xlim(map_extent[0], map_extent[1])
+ax_b.set_ylim(map_extent[2], map_extent[3])
+ax_b.set_title("Floodplain fraction per 1-km cell (HAND ≤ 10 m)", loc="left")
+ax_b.set_axis_off()
+add_panel_label(ax_b, "b")
+
+# ── Panel c — Urban conversion inside floodplain ──────────────
+plot_gdf.plot(
+    column="urban_in_fp_ha", ax=ax_c,
+    cmap="Reds", linewidth=0.0, legend=True,
+    legend_kwds={"label": "Urban conv. in FP (ha)", "shrink": 0.7},
+    missing_kwds={"color": "lightgrey"}
+)
+overlay_boundary(ax_c, muni_plot)
+ax_c.set_xlim(map_extent[0], map_extent[1])
+ax_c.set_ylim(map_extent[2], map_extent[3])
+ax_c.set_title(f"Urban conversion inside floodplain {REF_YEAR}–{TARGET_YEAR}", loc="left")
+ax_c.set_axis_off()
+add_panel_label(ax_c, "c")
+
+# ── Panel d — Floodplain class bar chart ─────────────────────
+grp = grouped_df.copy()
+short_labels = [c.replace("(", "").replace(")", "").replace("%","pct").strip()
+                for c in grp["fp_class"]]
+ax_d.barh(short_labels, grp["urban_in_fp_ha"],
+          color=[CLASS_COLORS.get(c, "#969696") for c in grp["fp_class"]],
+          edgecolor="white", linewidth=0.4)
+for i, v in enumerate(grp["urban_in_fp_ha"]):
+    ax_d.text(v + grp["urban_in_fp_ha"].max() * 0.01, i,
+              f"{v:,.0f} ha", va="center", fontsize=7.5)
+ax_d.set_title("Urban conversion in floodplain by class", loc="left")
+ax_d.set_xlabel("Urban area in floodplain (ha)")
+ax_d.tick_params(axis="y", labelsize=7.5)
+ax_d.grid(axis="x", linewidth=0.3, alpha=0.5)
+add_panel_label(ax_d, "d")
+
+# ── Panel e — Floodplain fraction vs NCI scatter ──────────────
+valid = analysis_gdf[
+    analysis_gdf["floodplain_fraction"].notna() &
+    analysis_gdf["NCI_BR"].notna()
+]
+ax_e.scatter(valid["floodplain_fraction"], valid["NCI_BR"],
+             s=8, alpha=0.45, color="#2171b5")
+if len(valid) > 2:
+    coef = np.polyfit(valid["floodplain_fraction"], valid["NCI_BR"], 1)
+    xl   = np.linspace(valid["floodplain_fraction"].min(),
+                        valid["floodplain_fraction"].max(), 100)
+    ax_e.plot(xl, coef[0] * xl + coef[1], "k-", linewidth=1.5)
+    corr = float(valid[["floodplain_fraction", "NCI_BR"]].corr().iloc[0, 1])
+    ax_e.text(0.97, 0.95, f"r = {corr:.3f}", transform=ax_e.transAxes,
+              ha="right", va="top", fontsize=8.5,
+              bbox=dict(facecolor="white", edgecolor="#bdbdbd", boxstyle="round,pad=0.3"))
+ax_e.set_title("Floodplain fraction vs NCI-BR", loc="left")
+ax_e.set_xlabel("Floodplain fraction (0–1)")
+ax_e.set_ylabel("NCI-BR score")
+ax_e.grid(True, linewidth=0.3, alpha=0.5)
+add_panel_label(ax_e, "e")
+
+# ── Panel f — Summary table ───────────────────────────────────
+ax_f.axis("off")
+sum_disp = summary_df.copy()
+sum_disp["value"] = sum_disp["value"].map(
+    lambda x: f"{x:,.2f}" if pd.notna(x) else "NA"
+)
+tbl = ax_f.table(
+    cellText=sum_disp[["metric", "value", "unit"]].values,
+    colLabels=["Metric", "Value", "Unit"],
+    loc="center", cellLoc="center"
+)
+tbl.auto_set_font_size(False); tbl.set_fontsize(6.0); tbl.scale(1.0, 1.38)
+for (row, col), cell in tbl.get_celld().items():
+    cell.set_edgecolor("#bdbdbd"); cell.set_linewidth(0.5)
+    if row == 0:
+        cell.set_facecolor("#f0f0f0"); cell.set_text_props(weight="bold")
+ax_f.set_title("Floodplain occupation summary", loc="left")
+add_panel_label(ax_f, "f")
+
+# ── Panel g — HAND histogram ──────────────────────────────────
+hand_vals = pd.to_numeric(analysis_gdf[hand_col], errors="coerce").dropna()
+if len(hand_vals) > 0:
+    ax_g.hist(hand_vals, bins=50, color="#2171b5",
+              edgecolor="white", linewidth=0.3, alpha=0.85)
+    ax_g.axvline(5,  color="#d62728", linewidth=1.2, linestyle="--", label="5 m")
+    ax_g.axvline(10, color="#fdae6b", linewidth=1.2, linestyle=":",  label="10 m")
+    ax_g.axvline(float(hand_vals.median()), color="black", linewidth=1.0,
+                 linestyle="-.", label=f"Median = {hand_vals.median():.1f} m")
+    ax_g.set_xlabel("Mean HAND (m)")
+    ax_g.set_ylabel("Number of 1-km cells")
+    ax_g.set_title("HAND distribution", loc="left")
+    ax_g.legend(fontsize=7.5, framealpha=0.85)
+    ax_g.grid(True, linewidth=0.3, alpha=0.5)
+else:
+    ax_g.axis("off")
+add_panel_label(ax_g, "g")
+
+# ── Panel h — NCI-BR map ─────────────────────────────────────
+if "NCI_BR" in plot_gdf.columns:
+    plot_gdf.plot(
+        column="NCI_BR", ax=ax_h,
+        cmap="YlGn", linewidth=0.0, legend=True,
+        legend_kwds={"label": "NCI-BR (0–100)", "shrink": 0.7},
+        missing_kwds={"color": "lightgrey"}, vmin=0, vmax=100
+    )
+    overlay_boundary(ax_h, muni_plot)
+    ax_h.set_xlim(map_extent[0], map_extent[1])
+    ax_h.set_ylim(map_extent[2], map_extent[3])
+    ax_h.set_title("NCI-BR baseline", loc="left")
+    ax_h.set_axis_off()
+else:
+    ax_h.axis("off")
+add_panel_label(ax_h, "h")
+
+# ── Panel i — Grouped statistics table ───────────────────────
+ax_i.axis("off")
+grp_disp = grouped_df.copy()
+for col in ["mean_NCI_BR", "urban_conv_ha", "urban_in_fp_ha"]:
+    grp_disp[col] = grp_disp[col].map(lambda x: f"{x:.1f}")
+grp_disp["fp_class"] = grp_disp["fp_class"].str[:18]
+tbl2 = ax_i.table(
+    cellText=grp_disp[["fp_class", "n_cells", "urban_conv_ha",
+                        "urban_in_fp_ha", "mean_NCI_BR"]].values,
+    colLabels=["Class", "Cells", "Urban (ha)", "In FP (ha)", "NCI"],
+    loc="center", cellLoc="center"
+)
+tbl2.auto_set_font_size(False); tbl2.set_fontsize(7.0); tbl2.scale(1.0, 1.45)
+for (row, col), cell in tbl2.get_celld().items():
+    cell.set_edgecolor("#bdbdbd"); cell.set_linewidth(0.5)
+    if row == 0:
+        cell.set_facecolor("#f0f0f0"); cell.set_text_props(weight="bold")
+    elif row > 0 and col == 0:
+        cls = grp_disp.iloc[row - 1]["fp_class"].strip()
+        full = next((k for k in CLASS_COLORS if cls in k), None)
+        if full: cell.set_facecolor(CLASS_COLORS[full])
+ax_i.set_title("Statistics by floodplain class", loc="left")
+add_panel_label(ax_i, "i")
+
+fig.suptitle(
+    f"Floodplain occupation diagnostics — NCI-BR | {MUNICIPALITY}, SP",
+    fontsize=13, fontweight="bold", y=0.995
+)
+fig.text(
+    0.02, 0.005,
+    "Floodplain: HAND ≤ 10 m (MERIT Hydro v1.0.1). "
+    "Conversion: MapBiomas class 24. No synthetic footprints.",
+    fontsize=7.5, color="#4d4d4d"
+)
+
+fig_png = DIRS["figures"] / "figure_12_nci_br_sjc_floodplain_diagnostics.png"
+fig_pdf = DIRS["figures"] / "figure_12_nci_br_sjc_floodplain_diagnostics.pdf"
+
+plt.savefig(fig_png, dpi=CONFIG["figure_dpi"], bbox_inches="tight")
+plt.savefig(fig_pdf, dpi=CONFIG["figure_dpi"], bbox_inches="tight")
+plt.show()
+print(f"\nFigure exported:\n  {fig_png}\n  {fig_pdf}")
+
+# ------------------------------------------------------------
+# 16. MD5 checksums + metadata
+# ------------------------------------------------------------
+
+checksums = {fp.name: md5_checksum(fp) for fp in [diag_gpkg, diag_csv]}
+checksums_path = DIRS["metadata"] / "nci_br_block13_checksums.json"
+with open(checksums_path, "w") as f:
+    json.dump(checksums, f, indent=4)
+
+block13_metadata = {
+    "block": "13", "version": "final",
+    "municipality": MUNICIPALITY,
+    "boundary_source": str(muni_path),
+    "hand_dataset": "MERIT/Hydro/v1_0_1",
+    "floodplain_threshold": "HAND ≤ 10 m",
+    "reference_year": REF_YEAR, "target_year": TARGET_YEAR,
+    "key_results": {
+        "urban_in_fp_ha":  round(tot_urb_fp, 1),
+        "native_in_fp_ha": round(tot_nat_fp, 1),
+        "pct_urban_in_fp": round(tot_urb_fp / tot_urban * 100, 2) if tot_urban > 0 else None,
+        "nci_exposure_fp": round(tot_nci_fp, 1),
+    },
+    "outputs": {
+        "diagnostic_gpkg": str(diag_gpkg),
+        "diagnostic_csv":  str(diag_csv),
+        "summary_csv":     str(summary_path),
+        "grouped_csv":     str(grouped_path),
+        "figure_png":      str(fig_png),
+        "checksums":       str(checksums_path),
+    },
+    "created_at": datetime.now().isoformat(),
+}
+
+metadata_path = DIRS["metadata"] / "nci_br_block13_metadata.json"
+with open(metadata_path, "w", encoding="utf-8") as f:
+    json.dump(block13_metadata, f, indent=4, ensure_ascii=False)
+print(f"Metadata saved: {metadata_path}")
+logger.info("Block 13 completed.")
+
+# ------------------------------------------------------------
+# 17. Final summary
+# ------------------------------------------------------------
+
+print("\n" + "=" * 62)
+print(f"BLOCK 13 — COMPLETED | {MUNICIPALITY}")
+print("=" * 62)
+print(f"  HAND dataset     : MERIT Hydro v1.0.1")
+print(f"  Floodplain def.  : HAND ≤ 10 m")
+print(f"  Analysis period  : {REF_YEAR}–{TARGET_YEAR}")
+print(f"  Grid cells (SJC) : {len(analysis_gdf)}")
+print(f"\n  Key findings:")
+if tot_urban > 0:
+    print(f"    Urban in FP    : {tot_urb_fp:,.0f} ha "
+          f"({tot_urb_fp/tot_urban*100:.1f} % of total conversion)")
+print(f"    Native in FP   : {tot_nat_fp:,.0f} ha")
+print(f"    NCI exp. in FP : {tot_nci_fp:,.0f} NCI × ha")
+print(f"\n  Floodplain class distribution:")
+for _, row in grouped_df.iterrows():
+    print(f"    {row['fp_class']:<25}: {int(row['n_cells']):>4} cells | "
+          f"{row['urban_in_fp_ha']:>8.1f} ha urban in FP")
+print("=" * 62)
+print("\nNext block: fragmentation and connectivity metrics.")
