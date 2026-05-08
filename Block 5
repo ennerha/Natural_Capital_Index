@@ -1,0 +1,788 @@
+# ============================================================
+# BRAZIL NCI-BR PROJECT
+# BLOCK 05 — HYDROLOGICAL REGULATION AND FLOOD-SUSCEPTIBILITY
+# FOCUS: SÃO JOSÉ DOS CAMPOS — SP, BRAZIL
+# ============================================================
+#
+# Corrections applied:
+#   [FIX-1]  File paths updated to nci_br_sjc_* pattern
+#   [FIX-2]  DIRS creation loop added
+#   [FIX-3]  plot_crs defined at block start
+#   [FIX-4]  clip_image_to_aoi() applied to all rasters
+#   [FIX-5]  Grid CSV exported via pd.DataFrame()
+#   [FIX-6]  Municipal boundary overlaid on all map panels
+#   [FIX-7]  Consistent map_extent applied to all map panels
+#   [FIX-8]  All output filenames follow nci_br_sjc_* pattern
+#   [FIX-9]  pick_col returns None instead of raising ValueError
+#   [FIX-10] tileScale=4 added to reduceRegions()
+#   [FIX-11] HAND fallback clamped to >= 0 (HAND cannot be negative)
+#   [FIX-12] Summary stats rounded before export
+#   [IMP-1]  MERIT upstream area band added (stream-order proxy)
+#   [IMP-2]  Flood-susceptibility class breakdown table added
+#   [IMP-3]  Score weights documented in comments
+#   [IMP-4]  water_occurrence threshold documented
+#   [NEW-1]  HAND and elevation distribution panels added
+#   [NEW-2]  Export.table.toDrive fallback documented
+# ============================================================
+
+import json
+import logging
+import hashlib
+from pathlib import Path
+from datetime import datetime
+
+import ee
+import geemap
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import matplotlib.patheffects as pe
+from matplotlib.colors import TwoSlopeNorm
+
+# ------------------------------------------------------------
+# 1. Reload project configuration
+# ------------------------------------------------------------
+
+PROJECT_ROOT = Path("/content/drive/MyDrive/Brazil/NCI_BR_Project")
+
+DIRS = {
+    "root":         PROJECT_ROOT,
+    "raw":          PROJECT_ROOT / "01_raw",
+    "intermediate": PROJECT_ROOT / "02_intermediate",
+    "processed":    PROJECT_ROOT / "03_processed",
+    "tables":       PROJECT_ROOT / "04_tables",
+    "figures":      PROJECT_ROOT / "05_figures",
+    "maps":         PROJECT_ROOT / "06_maps",
+    "exports":      PROJECT_ROOT / "07_exports",
+    "logs":         PROJECT_ROOT / "08_logs",
+    "metadata":     PROJECT_ROOT / "09_metadata",
+}
+
+# [FIX-2] Create directories
+for d in DIRS.values():
+    d.mkdir(parents=True, exist_ok=True)
+
+config_path = DIRS["metadata"] / "nci_br_config.json"
+with open(config_path, "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
+
+# [FIX-3] Define plot_crs at block start
+plot_crs     = CONFIG.get("output_crs", "EPSG:5880")
+MUNICIPALITY = "São José dos Campos"
+
+# ------------------------------------------------------------
+# 2. Logging
+# ------------------------------------------------------------
+
+log_file = DIRS["logs"] / f"nci_br_block05_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+logging.basicConfig(
+    filename=log_file, level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger("NCI_BR_BLOCK05")
+logger.info(f"Block 05 started — {MUNICIPALITY}.")
+print(f"Log file: {log_file}")
+
+# ------------------------------------------------------------
+# 3. Earth Engine initialization
+# ------------------------------------------------------------
+
+try:
+    ee.Initialize(project=CONFIG["gee_project_id"])
+    print("Google Earth Engine initialized.")
+except Exception:
+    ee.Authenticate()
+    ee.Initialize(project=CONFIG["gee_project_id"])
+    print("Google Earth Engine initialized after authentication.")
+
+# ------------------------------------------------------------
+# 4. [FIX-1] Load municipality and grid — correct SJC paths
+# ------------------------------------------------------------
+
+muni_path = DIRS["processed"] / "nci_br_sjc_municipality.gpkg"
+grid_path = DIRS["processed"] / "nci_br_sjc_grid_1km.gpkg"
+
+muni_gdf = gpd.read_file(muni_path)
+grid_gdf = gpd.read_file(grid_path)
+
+if muni_gdf.crs is None:
+    muni_gdf = muni_gdf.set_crs("EPSG:4674")
+if grid_gdf.crs is None:
+    grid_gdf = grid_gdf.set_crs(plot_crs)
+
+muni_ee  = geemap.geopandas_to_ee(muni_gdf.to_crs("EPSG:4326"))
+grid_ee  = geemap.geopandas_to_ee(grid_gdf.to_crs("EPSG:4326"))
+aoi_geom = muni_ee.geometry()
+
+print(f"Municipality loaded : {MUNICIPALITY}")
+print(f"Grid loaded         : {len(grid_gdf)} cells")
+
+# ------------------------------------------------------------
+# 5. Helper: clip_image_to_aoi (redefined inline)
+# ------------------------------------------------------------
+
+def clip_image_to_aoi(image: ee.Image, aoi_geometry: ee.Geometry) -> ee.Image:
+    """Clip and mask an ee.Image to the exact municipal boundary."""
+    return (
+        image
+        .clip(aoi_geometry)
+        .updateMask(ee.Image.constant(1).clip(aoi_geometry).unmask(0))
+    )
+
+# ------------------------------------------------------------
+# 6. Terrain and drainage datasets
+# ------------------------------------------------------------
+# Primary  : MERIT Hydro v1.0.1 (elevation, HAND, upstream area)
+# Fallback : SRTM elevation + approximate HAND derivation
+#
+# MERIT Hydro bands used:
+#   elv  — elevation (m)
+#   hnd  — Height Above Nearest Drainage (m)
+#   upa  — upstream drainage area (km²) [IMP-1]
+
+terrain_source = None
+
+try:
+    merit_raw = ee.Image("MERIT/Hydro/v1_0_1")
+
+    # [FIX-4] Apply clip_image_to_aoi to all rasters
+    merit      = clip_image_to_aoi(merit_raw, aoi_geom)
+    elevation  = merit.select("elv").rename("elevation_m")
+    hand       = merit.select("hnd").rename("HAND_m")
+    upstr_area = merit.select("upa").rename("upstream_area_km2")  # [IMP-1]
+
+    terrain_source = "MERIT Hydro v1.0.1"
+    print(f"Terrain source: {terrain_source}")
+
+except Exception as e_merit:
+    print(f"MERIT Hydro failed ({e_merit}). Falling back to SRTM.")
+
+    srtm_raw  = ee.Image("USGS/SRTMGL1_003")
+    elevation = clip_image_to_aoi(srtm_raw.select("elevation"), aoi_geom).rename("elevation_m")
+
+    # [FIX-11] HAND proxy: elev minus local minimum, clamped >= 0
+    # (approximation only — use MERIT when available)
+    hand = (
+        elevation
+        .subtract(elevation.focal_min(radius=1500, units="meters"))
+        .max(0)                    # HAND cannot be negative
+        .rename("HAND_m")
+    )
+    upstr_area = None              # Not available from SRTM
+    terrain_source = "SRTM (HAND approximated)"
+    print(f"Terrain source: {terrain_source}")
+
+# Slope from elevation (degrees)
+slope = ee.Terrain.slope(elevation).rename("slope_deg")
+
+print(f"Elevation, HAND, and slope layers ready.")
+
+# ------------------------------------------------------------
+# 7. JRC Global Surface Water — occurrence and water distance
+# ------------------------------------------------------------
+# occurrence: percentage of time a pixel was water (0–100 %)
+# Threshold >= 25 % identifies permanent and recurrent water.
+# [IMP-4] Threshold documented: 25 % ≈ water present ≥ 3 months/yr.
+
+jrc_raw    = ee.Image("JRC/GSW1_4/GlobalSurfaceWater")
+jrc        = clip_image_to_aoi(jrc_raw, aoi_geom)
+occurrence = jrc.select("occurrence").rename("water_occurrence_pct")
+seasonality = jrc.select("seasonality").rename("water_seasonality_months")
+
+# Recurrent water mask (occurrence >= 25 %)
+water_mask = occurrence.gte(25).selfMask().rename("water_mask")
+
+# Distance to nearest recurrent water body (metres)
+# fastDistanceTransform returns pixel-unit distances; multiply by pixel size.
+# Note: output is an approximation at 30-m Landsat scale.
+distance_to_water = (
+    water_mask.unmask(0)
+    .fastDistanceTransform(1024)
+    .sqrt()
+    .multiply(30)
+    .rename("distance_to_water_m")
+)
+
+# Water proximity score: 100 = on water, 0 = ≥ 5 km away
+water_proximity_score = (
+    ee.Image(1)
+    .subtract(distance_to_water.divide(5000).min(1))
+    .multiply(100)
+    .rename("water_proximity_score")
+)
+
+print("JRC Surface Water layers ready.")
+
+# ------------------------------------------------------------
+# 8. Flood-susceptibility and hydrological regulation scores
+# ------------------------------------------------------------
+# Scores range 0–100 (higher = more susceptible / higher regulation potential).
+#
+# Flood susceptibility weights [IMP-3]:
+#   HAND        0.55  — primary lowland indicator
+#   Slope       0.25  — secondary mobility indicator
+#   Water prox. 0.20  — proximity to recurrent water bodies
+#
+# Hydrological regulation weights [IMP-3]:
+#   Water prox. 0.40  — proximity to water bodies key for retention
+#   HAND        0.35  — lowland areas retain water naturally
+#   Slope       0.25  — low slope slows runoff
+
+# Low-HAND binary flags (useful as area-fraction indicators)
+hand_lte_2m  = hand.lte(2).rename("HAND_lte_2m")
+hand_lte_5m  = hand.lte(5).rename("HAND_lte_5m")
+hand_lte_10m = hand.lte(10).rename("HAND_lte_10m")
+slope_lte_3  = slope.lte(3).rename("slope_lte_3deg")
+
+# Component scores
+hand_score = (
+    ee.Image(1).subtract(hand.divide(20).min(1))
+    .multiply(100).rename("hand_lowland_score")
+)
+slope_score = (
+    ee.Image(1).subtract(slope.divide(15).min(1))
+    .multiply(100).rename("low_slope_score")
+)
+
+flood_susceptibility_score = (
+    hand_score.multiply(0.55)
+    .add(slope_score.multiply(0.25))
+    .add(water_proximity_score.multiply(0.20))
+    .rename("flood_susceptibility_score")
+)
+
+hydrological_regulation_score = (
+    water_proximity_score.multiply(0.40)
+    .add(hand_score.multiply(0.35))
+    .add(slope_score.multiply(0.25))
+    .rename("hydrological_regulation_score")
+)
+
+# ── Assemble multi-band stack ─────────────────────────────────
+hydro_bands = [
+    elevation, slope, hand, occurrence, seasonality,
+    distance_to_water, water_proximity_score,
+    hand_lte_2m, hand_lte_5m, hand_lte_10m, slope_lte_3,
+    hand_score, slope_score,
+    flood_susceptibility_score, hydrological_regulation_score,
+]
+
+if upstr_area is not None:
+    hydro_bands.insert(3, upstr_area)  # [IMP-1]
+
+hydro_stack = hydro_bands[0]
+for band in hydro_bands[1:]:
+    hydro_stack = hydro_stack.addBands(band)
+
+print("Hydrological indicator stack assembled.")
+
+# ------------------------------------------------------------
+# 9. Extract indicators per 1-km grid cell
+# ------------------------------------------------------------
+
+print(f"\nExtracting hydrological indicators per 1-km grid cell...")
+
+# [FIX-10] tileScale=4 prevents out-of-memory errors
+grid_hydro_ee = hydro_stack.reduceRegions(
+    collection=grid_ee,
+    reducer=(
+        ee.Reducer.mean()
+        .combine(ee.Reducer.median(),  sharedInputs=True)
+        .combine(ee.Reducer.stdDev(),  sharedInputs=True)
+        .combine(ee.Reducer.minMax(),  sharedInputs=True)
+    ),
+    scale=30,
+    tileScale=4
+)
+
+# Note: if geemap.ee_to_gdf times out, use Export instead:
+#
+#   task = ee.batch.Export.table.toDrive(
+#       collection  = grid_hydro_ee,
+#       description = "nci_br_sjc_grid_hydrological",
+#       folder      = "NCI_BR_Exports",
+#       fileFormat  = "CSV"
+#   )
+#   task.start()
+#   print(f"Export task started: {task.id}")
+
+grid_hydro_gdf = geemap.ee_to_gdf(grid_hydro_ee)
+
+if grid_hydro_gdf.crs is None:
+    grid_hydro_gdf = grid_hydro_gdf.set_crs("EPSG:4326")
+
+# [FIX-8] Output filenames follow nci_br_sjc_* pattern
+grid_hydro_path = DIRS["processed"] / "nci_br_sjc_grid_hydrological_indicators.gpkg"
+grid_hydro_csv  = DIRS["tables"]    / "nci_br_sjc_grid_hydrological_indicators.csv"
+
+grid_hydro_gdf.to_file(grid_hydro_path, layer="grid_hydrological", driver="GPKG")
+
+# [FIX-5] pd.DataFrame() before CSV export
+pd.DataFrame(grid_hydro_gdf.drop(columns="geometry")).to_csv(
+    grid_hydro_csv, index=False, encoding="utf-8-sig"
+)
+
+print(f"Grid hydrological GPKG : {grid_hydro_path}")
+print(f"Grid hydrological CSV  : {grid_hydro_csv}")
+logger.info(f"Grid hydrological: {len(grid_hydro_gdf)} cells | source: {terrain_source}")
+
+# ------------------------------------------------------------
+# 10. Summary statistics
+# ------------------------------------------------------------
+
+hydro_key_terms = [
+    "elevation", "slope", "HAND", "water", "distance",
+    "score", "flood", "hydrological", "upstream", "seasonality"
+]
+
+hydro_numeric_cols = sorted([
+    col for col in grid_hydro_gdf.columns
+    if any(k in col for k in hydro_key_terms) and col != "geometry"
+])
+
+summary_records = []
+for col in hydro_numeric_cols:
+    values = pd.to_numeric(grid_hydro_gdf[col], errors="coerce")
+    summary_records.append({
+        "indicator": col,
+        "mean":    round(float(values.mean()),            3),
+        "median":  round(float(values.median()),          3),
+        "std":     round(float(values.std()),             3),
+        "min":     round(float(values.min()),             3),
+        "q10":     round(float(values.quantile(0.10)),    3),
+        "q25":     round(float(values.quantile(0.25)),    3),
+        "q75":     round(float(values.quantile(0.75)),    3),
+        "q90":     round(float(values.quantile(0.90)),    3),
+        "max":     round(float(values.max()),             3),
+        "n_cells": int(values.notna().sum()),
+    })
+
+hydro_summary_df   = pd.DataFrame(summary_records)
+hydro_summary_path = DIRS["tables"] / "nci_br_sjc_grid_hydrological_summary.csv"
+hydro_summary_df.to_csv(hydro_summary_path, index=False, encoding="utf-8-sig")
+print(f"Summary statistics: {hydro_summary_path}")
+
+# ------------------------------------------------------------
+# 11. [IMP-2] Flood-susceptibility class breakdown
+# ------------------------------------------------------------
+# Classes: Low (<33), Moderate (33–66), High (>66)
+
+def classify_score(series, label):
+    low  = (series < 33).sum()
+    mid  = ((series >= 33) & (series <= 66)).sum()
+    high = (series > 66).sum()
+    total = series.notna().sum()
+    return {
+        "indicator": label,
+        "low_pct":      round(low  / total * 100, 1),
+        "moderate_pct": round(mid  / total * 100, 1),
+        "high_pct":     round(high / total * 100, 1),
+        "n_cells":      int(total),
+    }
+
+flood_col_raw  = next((c for c in grid_hydro_gdf.columns
+                        if "flood_susceptibility_score" in c and c.endswith("_mean")), None)
+hydro_col_raw  = next((c for c in grid_hydro_gdf.columns
+                        if "hydrological_regulation_score" in c and c.endswith("_mean")), None)
+
+class_records = []
+for col, label in [(flood_col_raw, "flood_susceptibility"),
+                   (hydro_col_raw,  "hydrological_regulation")]:
+    if col:
+        vals = pd.to_numeric(grid_hydro_gdf[col], errors="coerce").dropna()
+        class_records.append(classify_score(vals, label))
+
+class_df   = pd.DataFrame(class_records)
+class_path = DIRS["tables"] / "nci_br_sjc_grid_hydro_score_classes.csv"
+class_df.to_csv(class_path, index=False, encoding="utf-8-sig")
+print(f"Score class breakdown: {class_path}")
+
+if len(class_df) > 0:
+    print("\nFlood-susceptibility class distribution:")
+    print(class_df.to_string(index=False))
+
+# ------------------------------------------------------------
+# 12. Prepare plotting layers
+# ------------------------------------------------------------
+
+plot_gdf  = grid_hydro_gdf.to_crs(plot_crs)
+muni_plot = muni_gdf.to_crs(plot_crs)
+
+# Cast numeric columns
+for col in hydro_numeric_cols:
+    if col in plot_gdf.columns:
+        plot_gdf[col] = pd.to_numeric(plot_gdf[col], errors="coerce")
+
+# [FIX-7] Consistent map extent with buffer
+xmin, ymin, xmax, ymax = muni_plot.total_bounds
+xbuf = (xmax - xmin) * 0.05
+ybuf = (ymax - ymin) * 0.05
+map_extent = [xmin - xbuf, xmax + xbuf, ymin - ybuf, ymax + ybuf]
+
+
+def overlay_boundary(ax, gdf):
+    """Overlay municipal boundary on a map panel."""
+    gdf.boundary.plot(ax=ax, edgecolor="black", linewidth=1.2, zorder=5)
+
+
+def set_map_extent(ax):
+    ax.set_xlim(map_extent[0], map_extent[1])
+    ax.set_ylim(map_extent[2], map_extent[3])
+    ax.set_axis_off()
+
+
+def add_panel_label(ax, label):
+    ax.text(0.02, 0.97, label, transform=ax.transAxes,
+            fontsize=12, fontweight="bold", va="top", ha="left",
+            bbox=dict(facecolor="white", edgecolor="none",
+                      alpha=0.88, boxstyle="round,pad=0.22"))
+
+
+# [FIX-9] pick_col returns None instead of raising ValueError
+def pick_col(candidates, columns):
+    for c in candidates:
+        if c in columns:
+            return c
+    return None
+
+
+hand_col     = pick_col(["HAND_m_mean",       "HAND_m_median",       "HAND_m"],      plot_gdf.columns)
+slope_col    = pick_col(["slope_deg_mean",    "slope_deg_median",    "slope_deg"],   plot_gdf.columns)
+dist_col     = pick_col(["distance_to_water_m_mean", "distance_to_water_m_median"], plot_gdf.columns)
+flood_col    = pick_col(["flood_susceptibility_score_mean", "flood_susceptibility_score_median"],   plot_gdf.columns)
+hydro_col    = pick_col(["hydrological_regulation_score_mean", "hydrological_regulation_score_median"], plot_gdf.columns)
+wprx_col     = pick_col(["water_proximity_score_mean", "water_proximity_score_median"],             plot_gdf.columns)
+elev_col     = pick_col(["elevation_m_mean",  "elevation_m_median",  "elevation_m"], plot_gdf.columns)
+upstr_col    = pick_col(["upstream_area_km2_mean", "upstream_area_km2_median"],                     plot_gdf.columns)
+occur_col    = pick_col(["water_occurrence_pct_mean", "water_occurrence_pct_median"],               plot_gdf.columns)
+
+print(f"\nKey columns resolved:")
+for name, col in [
+    ("HAND",              hand_col),
+    ("Slope",             slope_col),
+    ("Distance to water", dist_col),
+    ("Flood score",       flood_col),
+    ("Regulation score",  hydro_col),
+    ("Water proximity",   wprx_col),
+    ("Elevation",         elev_col),
+    ("Upstream area",     upstr_col),
+]:
+    print(f"  {name:<20}: {col}")
+
+# ------------------------------------------------------------
+# 13. High-quality composite figure — 9 panels
+# ------------------------------------------------------------
+
+plt.rcParams.update({
+    "figure.dpi": 150, "savefig.dpi": CONFIG["figure_dpi"],
+    "font.family": "DejaVu Sans", "font.size": 9.5,
+    "axes.titlesize": 10, "axes.labelsize": 9,
+    "legend.fontsize": 8.5, "axes.linewidth": 0.7,
+    "pdf.fonttype": 42, "ps.fonttype": 42, "savefig.bbox": "tight",
+})
+
+fig = plt.figure(figsize=(16, 11), dpi=150)
+gs  = fig.add_gridspec(
+    nrows=3, ncols=3,
+    width_ratios=[1.2, 1.2, 1.0],
+    height_ratios=[1, 1, 1],
+    wspace=0.22, hspace=0.32
+)
+
+ax_a = fig.add_subplot(gs[0, 0])
+ax_b = fig.add_subplot(gs[0, 1])
+ax_c = fig.add_subplot(gs[0, 2])
+ax_d = fig.add_subplot(gs[1, 0])
+ax_e = fig.add_subplot(gs[1, 1])
+ax_f = fig.add_subplot(gs[1, 2])
+ax_g = fig.add_subplot(gs[2, 0])
+ax_h = fig.add_subplot(gs[2, 1])
+ax_i = fig.add_subplot(gs[2, 2])
+
+# ── Panel a — HAND map ────────────────────────────────────────
+if hand_col:
+    plot_gdf.plot(
+        column=hand_col, ax=ax_a,
+        cmap="terrain_r", linewidth=0.0, legend=True,
+        legend_kwds={"label": "Height above drainage (m)", "shrink": 0.7},
+        missing_kwds={"color": "lightgrey"}
+    )
+overlay_boundary(ax_a, muni_plot)
+set_map_extent(ax_a)
+ax_a.set_title("Height above nearest drainage (HAND) per cell", loc="left")
+add_panel_label(ax_a, "a")
+
+# ── Panel b — Distance to recurrent water map ─────────────────
+if dist_col:
+    plot_gdf.plot(
+        column=dist_col, ax=ax_b,
+        cmap="Blues_r", linewidth=0.0, legend=True,
+        legend_kwds={"label": "Distance to water (m)", "shrink": 0.7},
+        missing_kwds={"color": "lightgrey"}
+    )
+overlay_boundary(ax_b, muni_plot)
+set_map_extent(ax_b)
+ax_b.set_title("Mean distance to recurrent surface water per cell", loc="left")
+add_panel_label(ax_b, "b")
+
+# ── Panel c — Summary statistics table ───────────────────────
+ax_c.axis("off")
+
+priority_cols = [c for c in [hand_col, slope_col, dist_col,
+                               wprx_col, flood_col, hydro_col]
+                 if c is not None]
+table_df = hydro_summary_df[
+    hydro_summary_df["indicator"].isin(priority_cols)
+].copy()
+table_df["indicator"] = (
+    table_df["indicator"]
+    .str.replace("_mean", "", regex=False)
+    .str.replace("_m$",   "",  regex=True)
+    .str.replace("_",     " ")
+)
+for col in ["mean", "median", "q90"]:
+    table_df[col] = table_df[col].map(lambda x: f"{x:.2f}")
+
+table = ax_c.table(
+    cellText=table_df[["indicator", "mean", "median", "q90"]].values,
+    colLabels=["Indicator", "Mean", "Median", "Q90"],
+    loc="center", cellLoc="center"
+)
+table.auto_set_font_size(False)
+table.set_fontsize(7.2)
+table.scale(1.0, 1.32)
+for (row, col), cell in table.get_celld().items():
+    cell.set_edgecolor("#bdbdbd")
+    cell.set_linewidth(0.5)
+    if row == 0:
+        cell.set_facecolor("#f0f0f0")
+        cell.set_text_props(weight="bold")
+ax_c.set_title("Grid-level hydrological statistics", loc="left")
+add_panel_label(ax_c, "c")
+
+# ── Panel d — Flood-susceptibility score map ──────────────────
+if flood_col:
+    plot_gdf.plot(
+        column=flood_col, ax=ax_d,
+        cmap="PuBu", linewidth=0.0, legend=True,
+        legend_kwds={"label": "Flood susceptibility (0–100)", "shrink": 0.7},
+        missing_kwds={"color": "lightgrey"},
+        vmin=0, vmax=100
+    )
+overlay_boundary(ax_d, muni_plot)
+set_map_extent(ax_d)
+ax_d.set_title("Flood-susceptibility score per 1-km cell", loc="left")
+add_panel_label(ax_d, "d")
+
+# ── Panel e — Hydrological regulation score map ───────────────
+if hydro_col:
+    plot_gdf.plot(
+        column=hydro_col, ax=ax_e,
+        cmap="YlGnBu", linewidth=0.0, legend=True,
+        legend_kwds={"label": "Hydrological regulation (0–100)", "shrink": 0.7},
+        missing_kwds={"color": "lightgrey"},
+        vmin=0, vmax=100
+    )
+overlay_boundary(ax_e, muni_plot)
+set_map_extent(ax_e)
+ax_e.set_title("Hydrological regulation potential per 1-km cell", loc="left")
+add_panel_label(ax_e, "e")
+
+# ── Panel f — Water proximity score map ──────────────────────
+if wprx_col:
+    plot_gdf.plot(
+        column=wprx_col, ax=ax_f,
+        cmap="YlGnBu", linewidth=0.0, legend=True,
+        legend_kwds={"label": "Water proximity score (0–100)", "shrink": 0.7},
+        missing_kwds={"color": "lightgrey"},
+        vmin=0, vmax=100
+    )
+overlay_boundary(ax_f, muni_plot)
+set_map_extent(ax_f)
+ax_f.set_title("Water proximity score per 1-km cell", loc="left")
+add_panel_label(ax_f, "f")
+
+# ── Panel g — [NEW-1] HAND distribution histogram ────────────
+if hand_col and hand_col in plot_gdf.columns:
+    hand_vals = plot_gdf[hand_col].dropna()
+    ax_g.hist(hand_vals, bins=40, color="#2171b5", edgecolor="white",
+              linewidth=0.4, alpha=0.85)
+    ax_g.axvline(float(hand_vals.median()), color="black", linewidth=1.2,
+                 linestyle="--", label=f"Median = {hand_vals.median():.1f} m")
+    ax_g.axvline(5, color="#d62728", linewidth=1.0, linestyle=":",
+                 label="HAND = 5 m threshold")
+    ax_g.set_xlabel("HAND (m)")
+    ax_g.set_ylabel("Number of 1-km cells")
+    ax_g.set_title("Distribution of HAND across 1-km cells", loc="left")
+    ax_g.legend(fontsize=7.5, framealpha=0.85)
+    ax_g.grid(True, linewidth=0.3, alpha=0.5)
+else:
+    ax_g.axis("off")
+    ax_g.text(0.5, 0.5, "HAND data\nnot available", ha="center",
+              va="center", transform=ax_g.transAxes)
+add_panel_label(ax_g, "g")
+
+# ── Panel h — [NEW-1] Elevation distribution histogram ────────
+if elev_col and elev_col in plot_gdf.columns:
+    elev_vals = plot_gdf[elev_col].dropna()
+    ax_h.hist(elev_vals, bins=40, color="#6a51a3", edgecolor="white",
+              linewidth=0.4, alpha=0.85)
+    ax_h.axvline(float(elev_vals.median()), color="black", linewidth=1.2,
+                 linestyle="--", label=f"Median = {elev_vals.median():.0f} m")
+    ax_h.set_xlabel("Elevation (m a.s.l.)")
+    ax_h.set_ylabel("Number of 1-km cells")
+    ax_h.set_title("Elevation distribution across 1-km cells", loc="left")
+    ax_h.legend(fontsize=7.5, framealpha=0.85)
+    ax_h.grid(True, linewidth=0.3, alpha=0.5)
+else:
+    ax_h.axis("off")
+    ax_h.text(0.5, 0.5, "Elevation data\nnot available", ha="center",
+              va="center", transform=ax_h.transAxes)
+add_panel_label(ax_h, "h")
+
+# ── Panel i — [IMP-2] Score class breakdown bar chart ─────────
+if len(class_df) > 0:
+    x    = np.arange(len(class_df))
+    w    = 0.26
+    colors = {"Low": "#74c476", "Moderate": "#fd8d3c", "High": "#de2d26"}
+
+    ax_i.bar(x - w, class_df["low_pct"],      w, label="Low (<33)",     color=colors["Low"],      edgecolor="white")
+    ax_i.bar(x,     class_df["moderate_pct"], w, label="Moderate (33–66)", color=colors["Moderate"], edgecolor="white")
+    ax_i.bar(x + w, class_df["high_pct"],     w, label="High (>66)",    color=colors["High"],     edgecolor="white")
+
+    ax_i.set_xticks(x)
+    ax_i.set_xticklabels(
+        class_df["indicator"].str.replace("_", " ").str.title(),
+        fontsize=8
+    )
+    ax_i.set_ylabel("% of 1-km cells")
+    ax_i.set_title("Score class distribution across the municipality", loc="left")
+    ax_i.legend(fontsize=7.5, framealpha=0.85)
+    ax_i.grid(axis="y", linewidth=0.3, alpha=0.5)
+else:
+    ax_i.axis("off")
+    ax_i.text(0.5, 0.5, "Class breakdown\nnot available", ha="center",
+              va="center", transform=ax_i.transAxes)
+add_panel_label(ax_i, "i")
+
+fig.suptitle(
+    f"Hydrological regulation and flood-susceptibility — NCI-BR | {MUNICIPALITY}, SP",
+    fontsize=13, fontweight="bold", y=0.995
+)
+fig.text(
+    0.02, 0.005,
+    f"Data: {terrain_source} | JRC Global Surface Water v1.4 | "
+    "Spatial unit: 1-km grid clipped to IBGE municipal boundary.",
+    fontsize=7.5, color="#4d4d4d"
+)
+
+fig_png = DIRS["figures"] / "figure_04_nci_br_sjc_hydrological_indicators.png"
+fig_pdf = DIRS["figures"] / "figure_04_nci_br_sjc_hydrological_indicators.pdf"
+
+plt.savefig(fig_png, dpi=CONFIG["figure_dpi"], bbox_inches="tight")
+plt.savefig(fig_pdf, dpi=CONFIG["figure_dpi"], bbox_inches="tight")
+plt.show()
+
+print(f"\nFigure exported:\n  {fig_png}\n  {fig_pdf}")
+logger.info(f"Figure exported: {fig_png}")
+
+# ------------------------------------------------------------
+# 14. MD5 checksums
+# ------------------------------------------------------------
+
+def md5_checksum(fp: Path) -> str:
+    h = hashlib.md5()
+    with open(fp, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+checksum_files = [grid_hydro_path]
+checksums      = {fp.name: md5_checksum(fp) for fp in checksum_files}
+checksums_path = DIRS["metadata"] / "nci_br_block05_checksums.json"
+with open(checksums_path, "w") as f:
+    json.dump(checksums, f, indent=4)
+print(f"MD5 checksums: {checksums_path}")
+
+# ------------------------------------------------------------
+# 15. Block metadata
+# ------------------------------------------------------------
+
+block05_metadata = {
+    "block":        "05",
+    "version":      "final",
+    "municipality": MUNICIPALITY,
+    "terrain_source": terrain_source,
+    "datasets": [
+        "MERIT/Hydro/v1_0_1",
+        "USGS/SRTMGL1_003 (fallback)",
+        "JRC/GSW1_4/GlobalSurfaceWater",
+    ],
+    "score_weights": {
+        "flood_susceptibility": {
+            "HAND": 0.55, "slope": 0.25, "water_proximity": 0.20
+        },
+        "hydrological_regulation": {
+            "water_proximity": 0.40, "HAND": 0.35, "slope": 0.25
+        },
+    },
+    "indicators": {
+        "elevation_m":                    "Terrain elevation (m a.s.l.)",
+        "HAND_m":                         "Height Above Nearest Drainage (m)",
+        "slope_deg":                      "Terrain slope (degrees)",
+        "upstream_area_km2":              "MERIT upstream catchment area (km²)",
+        "water_occurrence_pct":           "JRC surface water occurrence (%)",
+        "water_seasonality_months":       "JRC surface water seasonality (months/yr)",
+        "distance_to_water_m":            "Distance to recurrent water body (m)",
+        "water_proximity_score":          "Water proximity score (0–100)",
+        "HAND_lte_2m":                    "Binary: HAND <= 2 m",
+        "HAND_lte_5m":                    "Binary: HAND <= 5 m",
+        "HAND_lte_10m":                   "Binary: HAND <= 10 m",
+        "flood_susceptibility_score":     "Composite flood susceptibility (0–100)",
+        "hydrological_regulation_score":  "Composite hydrological regulation potential (0–100)",
+    },
+    "outputs": {
+        "grid_hydro_gpkg":    str(grid_hydro_path),
+        "grid_hydro_csv":     str(grid_hydro_csv),
+        "summary_stats_csv":  str(hydro_summary_path),
+        "score_classes_csv":  str(class_path),
+        "figure_png":         str(fig_png),
+        "figure_pdf":         str(fig_pdf),
+        "checksums":          str(checksums_path),
+    },
+    "created_at": datetime.now().isoformat(),
+}
+
+metadata_path = DIRS["metadata"] / "nci_br_block05_metadata.json"
+with open(metadata_path, "w", encoding="utf-8") as f:
+    json.dump(block05_metadata, f, indent=4, ensure_ascii=False)
+print(f"Metadata saved: {metadata_path}")
+logger.info("Block 05 completed.")
+
+# ------------------------------------------------------------
+# 16. Final summary
+# ------------------------------------------------------------
+
+print("\n" + "=" * 62)
+print(f"BLOCK 05 — COMPLETED | {MUNICIPALITY}")
+print("=" * 62)
+print(f"  Terrain source   : {terrain_source}")
+print(f"  Grid cells       : {len(grid_hydro_gdf)}")
+
+if hand_col:
+    hand_vals_raw = pd.to_numeric(grid_hydro_gdf[hand_col], errors="coerce")
+    print(f"\n  HAND summary:")
+    print(f"    Mean   : {hand_vals_raw.mean():.1f} m")
+    print(f"    Median : {hand_vals_raw.median():.1f} m")
+    n_lte5 = (hand_vals_raw <= 5).sum()
+    print(f"    Cells with HAND ≤ 5 m : {n_lte5} ({n_lte5/len(hand_vals_raw)*100:.1f} %)")
+
+if len(class_df) > 0:
+    print(f"\n  Score class breakdown:")
+    print(class_df.to_string(index=False))
+
+print("=" * 62)
+print("\nNext block: integrate land cover, vegetation condition,")
+print("and hydrological indicators into the NCI-BR composite index.")
