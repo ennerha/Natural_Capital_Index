@@ -1,0 +1,795 @@
+# ============================================================
+# BRAZIL NCI-BR PROJECT
+# BLOCK 08 — OBSERVED LAND-CONVERSION ACCOUNTING
+# REAL DATA ONLY — NO SYNTHETIC FOOTPRINTS
+# FOCUS: SÃO JOSÉ DOS CAMPOS — SP, BRAZIL
+# ============================================================
+#
+# Corrections applied:
+#   [FIX-1]  File paths updated to nci_br_sjc_* pattern
+#   [FIX-2]  DIRS creation loop added
+#   [FIX-3]  plot_crs defined at block start
+#   [FIX-4]  All CSV exports wrapped in pd.DataFrame()
+#   [FIX-5]  Municipal boundary overlaid on all map panels
+#   [FIX-6]  Consistent map_extent applied to all map panels
+#   [FIX-7]  All output filenames follow nci_br_sjc_* pattern
+#   [FIX-8]  clip_image_to_aoi() applied to all MapBiomas images
+#   [FIX-9]  tileScale=4 added to reduceRegions()
+#   [FIX-10] Annual trajectory batched: 40 → 1 GEE call
+#   [FIX-11] ensure_grid_id() guards merge key
+#   [FIX-12] Variable name urban_TARGET_YEAR (not hardcoded _2024)
+#   [IMP-1]  Conversion by NCI-BR class breakdown added
+#   [IMP-2]  Per-decade expansion rates added
+#   [IMP-3]  Annual NCI-exposure trajectory panel added
+#   [IMP-4]  Top impacted cells include NCI class and LISA cluster
+#   [NEW-1]  MD5 checksums added
+#   [NEW-2]  Export.table.toDrive fallback documented
+#   [NEW-3]  Expanded to 9 panels
+# ============================================================
+
+import json
+import logging
+import hashlib
+from pathlib import Path
+from datetime import datetime
+
+import ee
+import geemap
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+
+# ------------------------------------------------------------
+# 1. Reload project configuration
+# ------------------------------------------------------------
+
+PROJECT_ROOT = Path("/content/drive/MyDrive/Brazil/NCI_BR_Project")
+
+DIRS = {
+    "root":         PROJECT_ROOT,
+    "raw":          PROJECT_ROOT / "01_raw",
+    "intermediate": PROJECT_ROOT / "02_intermediate",
+    "processed":    PROJECT_ROOT / "03_processed",
+    "tables":       PROJECT_ROOT / "04_tables",
+    "figures":      PROJECT_ROOT / "05_figures",
+    "maps":         PROJECT_ROOT / "06_maps",
+    "exports":      PROJECT_ROOT / "07_exports",
+    "logs":         PROJECT_ROOT / "08_logs",
+    "metadata":     PROJECT_ROOT / "09_metadata",
+}
+
+# [FIX-2] Create directories
+for d in DIRS.values():
+    d.mkdir(parents=True, exist_ok=True)
+
+config_path = DIRS["metadata"] / "nci_br_config.json"
+with open(config_path, "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
+
+# [FIX-3]
+plot_crs     = CONFIG.get("output_crs", "EPSG:5880")
+MUNICIPALITY = "São José dos Campos"
+
+# ------------------------------------------------------------
+# 2. Logging
+# ------------------------------------------------------------
+
+log_file = DIRS["logs"] / f"nci_br_block08_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+logging.basicConfig(
+    filename=log_file, level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger("NCI_BR_BLOCK08")
+logger.info(f"Block 08 started — {MUNICIPALITY}. Observed conversion only.")
+print(f"Log file: {log_file}")
+
+# ------------------------------------------------------------
+# 3. Earth Engine initialization
+# ------------------------------------------------------------
+
+try:
+    ee.Initialize(project=CONFIG["gee_project_id"])
+    print("Google Earth Engine initialized.")
+except Exception:
+    ee.Authenticate()
+    ee.Initialize(project=CONFIG["gee_project_id"])
+    print("Google Earth Engine initialized after authentication.")
+
+# ------------------------------------------------------------
+# 4. [FIX-1] Load municipality, grid, and NCI-BR
+# ------------------------------------------------------------
+
+muni_path = DIRS["processed"] / "nci_br_sjc_municipality.gpkg"
+grid_path = DIRS["processed"] / "nci_br_sjc_grid_1km.gpkg"
+
+# Prefer spatial-statistics output; fall back to integrated index
+nci_path  = DIRS["processed"] / "nci_br_sjc_spatial_statistics.gpkg"
+if not nci_path.exists():
+    nci_path = DIRS["processed"] / "nci_br_sjc_grid_integrated_index.gpkg"
+
+for p in [muni_path, grid_path, nci_path]:
+    if not p.exists():
+        raise FileNotFoundError(
+            f"Required input not found: {p}\n"
+            "Run Blocks 02, 06, and 07 before Block 08."
+        )
+
+muni_gdf = gpd.read_file(muni_path)
+grid_gdf = gpd.read_file(grid_path)
+nci_gdf  = gpd.read_file(nci_path)
+
+if muni_gdf.crs is None: muni_gdf = muni_gdf.set_crs("EPSG:4674")
+if grid_gdf.crs is None: grid_gdf = grid_gdf.set_crs(plot_crs)
+if nci_gdf.crs  is None: nci_gdf  = nci_gdf.set_crs(plot_crs)
+
+muni_gdf = muni_gdf.to_crs(plot_crs)
+grid_gdf = grid_gdf.to_crs(plot_crs)
+nci_gdf  = nci_gdf.to_crs(plot_crs)
+
+muni_ee  = geemap.geopandas_to_ee(muni_gdf.to_crs("EPSG:4326"))
+grid_ee  = geemap.geopandas_to_ee(grid_gdf.to_crs("EPSG:4326"))
+aoi_geom = muni_ee.geometry()
+
+print(f"Municipality loaded : {MUNICIPALITY}")
+print(f"Grid loaded         : {len(grid_gdf)} cells")
+print(f"NCI-BR loaded       : {len(nci_gdf)} cells")
+
+# ------------------------------------------------------------
+# 5. [FIX-11] Ensure grid_id present before merge
+# ------------------------------------------------------------
+
+def ensure_grid_id(gdf: gpd.GeoDataFrame, label: str) -> gpd.GeoDataFrame:
+    if "grid_id" not in gdf.columns:
+        print(f"  WARNING: grid_id missing from {label}. Using index.")
+        gdf = gdf.copy()
+        gdf["grid_id"] = gdf.index.astype(int)
+    return gdf
+
+grid_gdf = ensure_grid_id(grid_gdf, "grid")
+nci_gdf  = ensure_grid_id(nci_gdf,  "NCI-BR")
+
+# ------------------------------------------------------------
+# 6. MapBiomas and analysis parameters
+# ------------------------------------------------------------
+
+mapbiomas     = ee.Image(CONFIG["mapbiomas_asset"])
+TARGET_YEAR   = int(CONFIG["baseline_year"])
+REFERENCE_YEARS = [1985, 2000, 2010, 2015]
+START_YEAR    = 1985
+
+URBAN_CLASS       = 24
+NATIVE_CLASSES    = [3, 4, 5, 6, 11, 12, 32, 49, 50]
+AGRI_CLASSES      = [15, 18, 19, 20, 39, 40, 41, 46, 47, 48]
+WATER_CLASSES     = [33]
+MINING_CLASSES    = [30]
+
+print(f"\nObserved conversion: {START_YEAR}–{TARGET_YEAR}")
+print(f"Reference years    : {REFERENCE_YEARS}")
+
+# ------------------------------------------------------------
+# 7. Helper functions
+# ------------------------------------------------------------
+
+def clip_image_to_aoi(image: ee.Image, aoi_geometry: ee.Geometry) -> ee.Image:
+    """Clip and mask ee.Image to the exact municipal boundary."""
+    return (
+        image
+        .clip(aoi_geometry)
+        .updateMask(ee.Image.constant(1).clip(aoi_geometry).unmask(0))
+    )
+
+
+def class_mask(img: ee.Image, classes: list) -> ee.Image:
+    return img.remap(classes, [1] * len(classes), 0).eq(1)
+
+
+def area_band(mask: ee.Image, name: str) -> ee.Image:
+    return ee.Image.pixelArea().divide(1e4).updateMask(mask).rename(name)
+
+
+def safe_numeric(df: pd.DataFrame, cols: list) -> pd.DataFrame:
+    for col in cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    return df
+
+# ------------------------------------------------------------
+# 8. Build observed conversion stack
+# ------------------------------------------------------------
+
+# [FIX-12] Use TARGET_YEAR variable in band name (not hardcoded _2024)
+lulc_target    = clip_image_to_aoi(
+    mapbiomas.select(f"classification_{TARGET_YEAR}"), aoi_geom
+)
+urban_target   = lulc_target.eq(URBAN_CLASS)   # [FIX-12] renamed
+
+conversion_bands = [
+    area_band(urban_target, f"urban_{TARGET_YEAR}_ha")
+]
+
+for ref_year in REFERENCE_YEARS:
+    lulc_ref     = clip_image_to_aoi(
+        mapbiomas.select(f"classification_{ref_year}"), aoi_geom
+    )   # [FIX-8]
+    urban_ref    = lulc_ref.eq(URBAN_CLASS)
+    new_urban    = urban_target.And(urban_ref.Not())  # net new urban since ref_year
+
+    native_ref   = class_mask(lulc_ref, NATIVE_CLASSES)
+    agri_ref     = class_mask(lulc_ref, AGRI_CLASSES)
+    water_ref    = class_mask(lulc_ref, WATER_CLASSES)
+    mining_ref   = class_mask(lulc_ref, MINING_CLASSES)
+
+    conversion_bands += [
+        area_band(new_urban,                     f"new_urban_{ref_year}_{TARGET_YEAR}_ha"),
+        area_band(new_urban.And(native_ref),     f"native_to_urban_{ref_year}_{TARGET_YEAR}_ha"),
+        area_band(new_urban.And(agri_ref),       f"agri_to_urban_{ref_year}_{TARGET_YEAR}_ha"),
+        area_band(new_urban.And(water_ref),      f"water_to_urban_{ref_year}_{TARGET_YEAR}_ha"),
+        area_band(new_urban.And(mining_ref),     f"mining_to_urban_{ref_year}_{TARGET_YEAR}_ha"),
+    ]
+
+conversion_stack = conversion_bands[0]
+for band in conversion_bands[1:]:
+    conversion_stack = conversion_stack.addBands(band)
+
+print("Conversion indicator stack assembled.")
+
+# ------------------------------------------------------------
+# 9. Extract conversion indicators per 1-km grid cell
+# ------------------------------------------------------------
+
+print("\nExtracting observed conversion indicators per 1-km grid cell...")
+
+# [FIX-9] tileScale=4
+conversion_ee = conversion_stack.reduceRegions(
+    collection=grid_ee,
+    reducer=ee.Reducer.sum(),
+    scale=30,
+    tileScale=4
+)
+
+# Note: if geemap.ee_to_gdf times out use Export:
+#   task = ee.batch.Export.table.toDrive(
+#       collection  = conversion_ee,
+#       description = "nci_br_sjc_observed_conversion",
+#       folder      = "NCI_BR_Exports", fileFormat = "CSV"
+#   )
+#   task.start(); print(f"Export task: {task.id}")
+
+conversion_gdf = geemap.ee_to_gdf(conversion_ee)
+if conversion_gdf.crs is None:
+    conversion_gdf = conversion_gdf.set_crs("EPSG:4326")
+conversion_gdf = conversion_gdf.to_crs(plot_crs)
+
+conversion_gdf = ensure_grid_id(conversion_gdf, "conversion")
+
+conversion_cols = [c for c in conversion_gdf.columns if c.endswith("_ha")]
+conversion_gdf  = safe_numeric(conversion_gdf, conversion_cols)
+
+print(f"Conversion grid: {len(conversion_gdf)} cells | {len(conversion_cols)} area bands")
+
+# ------------------------------------------------------------
+# 10. Merge with NCI-BR
+# ------------------------------------------------------------
+
+nci_cols = [c for c in [
+    "grid_id", "NCI_BR", "NCI_BR_class", "NCI_BR_typology",
+    "score_native_vegetation", "score_hydrological_regulation",
+    "score_low_anthropic_pressure", "score_vegetation_condition",
+    "LISA_cluster", "Gi_cluster",
+] if c in nci_gdf.columns]
+
+nci_table = pd.DataFrame(nci_gdf[nci_cols])
+
+observed_gdf = conversion_gdf.merge(nci_table, on="grid_id", how="left")
+
+for col in ["NCI_BR", "score_native_vegetation",
+            "score_hydrological_regulation",
+            "score_low_anthropic_pressure",
+            "score_vegetation_condition"]:
+    if col in observed_gdf.columns:
+        observed_gdf[col] = pd.to_numeric(observed_gdf[col], errors="coerce")
+
+print(f"Merged observed grid: {len(observed_gdf)} cells")
+
+# ------------------------------------------------------------
+# 11. [FIX-10] Annual urban trajectory — 1 GEE call (multiband)
+# ------------------------------------------------------------
+# Build a multiband image (one band per year) then reduce once.
+
+print(f"\nBuilding annual urban trajectory {START_YEAR}–{TARGET_YEAR} (single GEE call)...")
+
+year_bands = []
+years_list = list(range(START_YEAR, TARGET_YEAR + 1))
+
+for year in years_list:
+    lulc  = clip_image_to_aoi(mapbiomas.select(f"classification_{year}"), aoi_geom)
+    band  = (
+        ee.Image.pixelArea().divide(1e4)
+        .updateMask(lulc.eq(URBAN_CLASS))
+        .rename(f"urban_{year}")
+    )
+    year_bands.append(band)
+
+annual_stack = year_bands[0]
+for b in year_bands[1:]:
+    annual_stack = annual_stack.addBands(b)
+
+annual_result = annual_stack.reduceRegion(
+    reducer=ee.Reducer.sum(),
+    geometry=aoi_geom,
+    scale=30, maxPixels=1e13, bestEffort=True
+).getInfo()
+
+annual_urban_df = pd.DataFrame([
+    {"year": yr, "urban_ha": float(annual_result.get(f"urban_{yr}", 0) or 0)}
+    for yr in years_list
+])
+
+base_ha = float(annual_urban_df.loc[annual_urban_df["year"] == START_YEAR, "urban_ha"].iloc[0])
+annual_urban_df["urban_change_since_1985_ha"] = annual_urban_df["urban_ha"] - base_ha
+
+# [IMP-2] Per-decade expansion rates (ha/decade)
+decades = [(1985, 1995), (1995, 2005), (2005, 2015), (2015, TARGET_YEAR)]
+decade_records = []
+for y0, y1 in decades:
+    if y1 > TARGET_YEAR:
+        y1 = TARGET_YEAR
+    ha0 = float(annual_urban_df.loc[annual_urban_df["year"] == y0, "urban_ha"].iloc[0])
+    ha1 = float(annual_urban_df.loc[annual_urban_df["year"] == y1, "urban_ha"].iloc[0])
+    decade_records.append({
+        "period": f"{y0}–{y1}",
+        "urban_ha_start": round(ha0, 1),
+        "urban_ha_end":   round(ha1, 1),
+        "delta_ha":       round(ha1 - ha0, 1),
+        "rate_ha_per_yr": round((ha1 - ha0) / max(y1 - y0, 1), 1),
+    })
+decade_df = pd.DataFrame(decade_records)
+
+print(f"Annual urban trajectory computed: {len(annual_urban_df)} years")
+print(f"\nDecadal expansion rates:")
+print(decade_df.to_string(index=False))
+
+# ------------------------------------------------------------
+# 12. Observed impact accounting per reference year
+# ------------------------------------------------------------
+
+for ref_year in REFERENCE_YEARS:
+    new_col    = f"new_urban_{ref_year}_{TARGET_YEAR}_ha"
+    native_col = f"native_to_urban_{ref_year}_{TARGET_YEAR}_ha"
+
+    observed_gdf[f"NCI_exposure_{ref_year}_{TARGET_YEAR}"] = (
+        observed_gdf.get(new_col, 0) * observed_gdf["NCI_BR"]
+    )
+    observed_gdf[f"native_cap_exposure_{ref_year}_{TARGET_YEAR}"] = (
+        observed_gdf.get(native_col, 0) * observed_gdf["score_native_vegetation"]
+    )
+    observed_gdf[f"hydro_cap_exposure_{ref_year}_{TARGET_YEAR}"] = (
+        observed_gdf.get(new_col, 0) * observed_gdf["score_hydrological_regulation"]
+    )
+
+# ------------------------------------------------------------
+# 13. [IMP-1] Conversion by NCI-BR class
+# ------------------------------------------------------------
+# What fraction of each NCI quintile class was converted to urban?
+
+main_ref     = 1985
+main_new_col = f"new_urban_{main_ref}_{TARGET_YEAR}_ha"
+
+if "NCI_BR_class" in observed_gdf.columns and main_new_col in observed_gdf.columns:
+    class_conversion = (
+        observed_gdf.groupby("NCI_BR_class", observed=False)
+        .agg(
+            n_cells=("grid_id", "count"),
+            total_new_urban_ha=(main_new_col, "sum"),
+            mean_NCI_BR=("NCI_BR", "mean"),
+        )
+        .reset_index()
+    )
+    if "grid_area_ha" in observed_gdf.columns:
+        class_area = observed_gdf.groupby("NCI_BR_class", observed=False)["grid_area_ha"].sum()
+        class_conversion = class_conversion.merge(
+            class_area.rename("total_cell_area_ha"), on="NCI_BR_class", how="left"
+        )
+        class_conversion["pct_class_converted"] = (
+            class_conversion["total_new_urban_ha"] /
+            class_conversion["total_cell_area_ha"].replace(0, np.nan) * 100
+        ).round(2)
+else:
+    class_conversion = pd.DataFrame()
+
+# ------------------------------------------------------------
+# 14. AOI-level summary per reference year
+# ------------------------------------------------------------
+
+summary_records = []
+for ref_year in REFERENCE_YEARS:
+    new_col    = f"new_urban_{ref_year}_{TARGET_YEAR}_ha"
+    native_col = f"native_to_urban_{ref_year}_{TARGET_YEAR}_ha"
+    agri_col   = f"agri_to_urban_{ref_year}_{TARGET_YEAR}_ha"
+    water_col  = f"water_to_urban_{ref_year}_{TARGET_YEAR}_ha"
+    mining_col = f"mining_to_urban_{ref_year}_{TARGET_YEAR}_ha"
+    nci_exp_col = f"NCI_exposure_{ref_year}_{TARGET_YEAR}"
+
+    affected = observed_gdf[observed_gdf.get(new_col, pd.Series(0, index=observed_gdf.index)) > 0]
+
+    summary_records.append({
+        "reference_year":              ref_year,
+        "target_year":                 TARGET_YEAR,
+        "new_urban_ha":                round(observed_gdf[new_col].sum(),    1) if new_col    in observed_gdf.columns else 0,
+        "native_to_urban_ha":          round(observed_gdf[native_col].sum(), 1) if native_col in observed_gdf.columns else 0,
+        "agri_to_urban_ha":            round(observed_gdf[agri_col].sum(),   1) if agri_col   in observed_gdf.columns else 0,
+        "water_to_urban_ha":           round(observed_gdf[water_col].sum(),  1) if water_col  in observed_gdf.columns else 0,
+        "mining_to_urban_ha":          round(observed_gdf[mining_col].sum(), 1) if mining_col in observed_gdf.columns else 0,
+        "affected_cells":              len(affected),
+        "mean_NCI_converted_cells":    round(float(affected["NCI_BR"].mean()),   2) if len(affected) else np.nan,
+        "median_NCI_converted_cells":  round(float(affected["NCI_BR"].median()), 2) if len(affected) else np.nan,
+        "NCI_exposure_area_weighted":  round(observed_gdf[nci_exp_col].sum(),    2) if nci_exp_col in observed_gdf.columns else 0,
+    })
+
+summary_df = pd.DataFrame(summary_records)
+
+# Top impacted cells 1985→TARGET_YEAR  [IMP-4]
+main_nci_exp_col = f"NCI_exposure_{main_ref}_{TARGET_YEAR}"
+if main_nci_exp_col in observed_gdf.columns:
+    top_cells = (
+        observed_gdf[observed_gdf[main_new_col] > 0]
+        .sort_values(main_nci_exp_col, ascending=False)
+        .head(30)
+    )
+else:
+    top_cells = observed_gdf.head(0)
+
+# ------------------------------------------------------------
+# 15. Export products
+# ------------------------------------------------------------
+
+observed_path    = DIRS["processed"] / "nci_br_sjc_observed_conversion.gpkg"
+observed_csv     = DIRS["tables"]    / "nci_br_sjc_observed_conversion.csv"
+summary_path     = DIRS["tables"]    / "nci_br_sjc_observed_conversion_summary.csv"
+annual_path      = DIRS["tables"]    / "nci_br_sjc_urban_trajectory_annual.csv"
+decade_path      = DIRS["tables"]    / "nci_br_sjc_urban_expansion_rates.csv"
+class_conv_path  = DIRS["tables"]    / "nci_br_sjc_conversion_by_nci_class.csv"
+top_cells_path   = DIRS["tables"]    / "nci_br_sjc_top_conversion_cells.csv"
+
+observed_gdf.to_file(observed_path, layer="observed_conversion", driver="GPKG")
+
+# [FIX-4] pd.DataFrame() before CSV export
+pd.DataFrame(observed_gdf.drop(columns="geometry", errors="ignore")).to_csv(
+    observed_csv, index=False, encoding="utf-8-sig"
+)
+summary_df.to_csv(summary_path,  index=False, encoding="utf-8-sig")
+annual_urban_df.to_csv(annual_path,  index=False, encoding="utf-8-sig")
+decade_df.to_csv(decade_path,   index=False, encoding="utf-8-sig")
+
+if len(class_conversion) > 0:
+    class_conversion.to_csv(class_conv_path, index=False, encoding="utf-8-sig")
+
+pd.DataFrame(top_cells.drop(columns="geometry", errors="ignore")).to_csv(
+    top_cells_path, index=False, encoding="utf-8-sig"
+)
+
+print(f"\nObserved conversion products exported:")
+for p in [observed_path, observed_csv, summary_path, annual_path,
+          decade_path, class_conv_path, top_cells_path]:
+    print(f"  {p}")
+logger.info(f"Observed conversion: {len(observed_gdf)} cells | {len(summary_df)} ref years")
+
+# ------------------------------------------------------------
+# 16. Prepare plotting layers
+# ------------------------------------------------------------
+
+plot_gdf  = observed_gdf.copy()
+muni_plot = muni_gdf.to_crs(plot_crs)
+
+for col in conversion_cols + ["NCI_BR", "score_native_vegetation"]:
+    if col in plot_gdf.columns:
+        plot_gdf[col] = pd.to_numeric(plot_gdf[col], errors="coerce")
+
+xmin, ymin, xmax, ymax = muni_plot.total_bounds
+xbuf = (xmax - xmin) * 0.05
+ybuf = (ymax - ymin) * 0.05
+map_extent = [xmin - xbuf, xmax + xbuf, ymin - ybuf, ymax + ybuf]
+
+
+def overlay_boundary(ax, gdf):
+    gdf.boundary.plot(ax=ax, edgecolor="black", linewidth=1.2, zorder=5)
+
+
+def set_map_extent(ax):
+    ax.set_xlim(map_extent[0], map_extent[1])
+    ax.set_ylim(map_extent[2], map_extent[3])
+    ax.set_axis_off()
+
+
+def add_panel_label(ax, label):
+    ax.text(0.02, 0.97, label, transform=ax.transAxes,
+            fontsize=12, fontweight="bold", va="top", ha="left",
+            bbox=dict(facecolor="white", edgecolor="none",
+                      alpha=0.88, boxstyle="round,pad=0.22"))
+
+main_native_col = f"native_to_urban_{main_ref}_{TARGET_YEAR}_ha"
+
+# ------------------------------------------------------------
+# 17. High-quality composite figure — 9 panels
+# ------------------------------------------------------------
+
+plt.rcParams.update({
+    "figure.dpi": 150, "savefig.dpi": CONFIG["figure_dpi"],
+    "font.family": "DejaVu Sans", "font.size": 9.5,
+    "axes.titlesize": 10, "axes.labelsize": 9,
+    "legend.fontsize": 8.5, "axes.linewidth": 0.7,
+    "pdf.fonttype": 42, "ps.fonttype": 42, "savefig.bbox": "tight",
+})
+
+fig = plt.figure(figsize=(16, 11), dpi=150)
+gs  = fig.add_gridspec(
+    nrows=3, ncols=3,
+    width_ratios=[1.2, 1.2, 1.0],
+    height_ratios=[1, 1, 1],
+    wspace=0.22, hspace=0.32
+)
+
+ax_a = fig.add_subplot(gs[0, 0])
+ax_b = fig.add_subplot(gs[0, 1])
+ax_c = fig.add_subplot(gs[0, 2])
+ax_d = fig.add_subplot(gs[1, 0])
+ax_e = fig.add_subplot(gs[1, 1])
+ax_f = fig.add_subplot(gs[1, 2])
+ax_g = fig.add_subplot(gs[2, 0])
+ax_h = fig.add_subplot(gs[2, 1])
+ax_i = fig.add_subplot(gs[2, 2])
+
+# ── Panel a — NCI-BR baseline map ────────────────────────────
+plot_gdf.plot(
+    column="NCI_BR", ax=ax_a,
+    cmap="YlGn", linewidth=0.0, legend=True,
+    legend_kwds={"label": "NCI-BR (0–100)", "shrink": 0.7},
+    missing_kwds={"color": "lightgrey"}, vmin=0, vmax=100
+)
+overlay_boundary(ax_a, muni_plot)
+set_map_extent(ax_a)
+ax_a.set_title("Current NCI-BR baseline", loc="left")
+add_panel_label(ax_a, "a")
+
+# ── Panel b — New urban area 1985→target ─────────────────────
+if main_new_col in plot_gdf.columns:
+    plot_gdf.plot(
+        column=main_new_col, ax=ax_b,
+        cmap="Reds", linewidth=0.0, legend=True,
+        legend_kwds={"label": "New urban area (ha)", "shrink": 0.7},
+        missing_kwds={"color": "lightgrey"}
+    )
+overlay_boundary(ax_b, muni_plot)
+set_map_extent(ax_b)
+ax_b.set_title(f"Observed new urban area {main_ref}–{TARGET_YEAR} (ha/cell)", loc="left")
+add_panel_label(ax_b, "b")
+
+# ── Panel c — Native vegetation → urban ──────────────────────
+if main_native_col in plot_gdf.columns:
+    plot_gdf.plot(
+        column=main_native_col, ax=ax_c,
+        cmap="OrRd", linewidth=0.0, legend=True,
+        legend_kwds={"label": "Native veg. → urban (ha)", "shrink": 0.7},
+        missing_kwds={"color": "lightgrey"}
+    )
+overlay_boundary(ax_c, muni_plot)
+set_map_extent(ax_c)
+ax_c.set_title(f"Native vegetation → urban {main_ref}–{TARGET_YEAR} (ha/cell)", loc="left")
+add_panel_label(ax_c, "c")
+
+# ── Panel d — Annual urban trajectory ────────────────────────
+ax_d.plot(annual_urban_df["year"], annual_urban_df["urban_ha"],
+          color="#d62728", linewidth=2.2)
+ax_d.fill_between(annual_urban_df["year"], annual_urban_df["urban_ha"],
+                  alpha=0.12, color="#d62728")
+for y0, y1 in [(1985, 1995), (2000, 2000), (2010, 2010), (2015, 2015)]:
+    ax_d.axvline(y1, color="gray", linewidth=0.6, linestyle="--", alpha=0.5)
+ax_d.set_title(f"Urban / infrastructure area {START_YEAR}–{TARGET_YEAR}", loc="left")
+ax_d.set_xlabel("Year")
+ax_d.set_ylabel("Area (ha)")
+ax_d.grid(True, linewidth=0.3, alpha=0.5)
+add_panel_label(ax_d, "d")
+
+# ── Panel e — Conversion source by reference year ────────────
+x     = np.arange(len(summary_df))
+width = 0.30
+
+ax_e.bar(x - width,   summary_df["native_to_urban_ha"], width,
+         label="Native → urban",  color="#1a7a3c", edgecolor="white")
+ax_e.bar(x,            summary_df["agri_to_urban_ha"],   width,
+         label="Agri. → urban",   color="#d95f02", edgecolor="white")
+ax_e.bar(x + width,   summary_df["water_to_urban_ha"] + summary_df["mining_to_urban_ha"], width,
+         label="Water/mining → urban", color="#7570b3", edgecolor="white")
+
+ax_e.set_xticks(x)
+ax_e.set_xticklabels(
+    [f"{int(r['reference_year'])}–{TARGET_YEAR}" for _, r in summary_df.iterrows()],
+    rotation=20, fontsize=8
+)
+ax_e.set_title("Observed conversion by prior land cover", loc="left")
+ax_e.set_ylabel("Area converted (ha)")
+ax_e.legend(fontsize=7.5, framealpha=0.85)
+ax_e.grid(axis="y", linewidth=0.3, alpha=0.5)
+add_panel_label(ax_e, "e")
+
+# ── Panel f — Accounting summary table ───────────────────────
+ax_f.axis("off")
+
+tbl_df = summary_df.copy()
+for col in ["new_urban_ha", "native_to_urban_ha"]:
+    tbl_df[col] = tbl_df[col].map(lambda x: f"{x:,.0f}")
+tbl_df["mean_NCI_converted_cells"] = tbl_df["mean_NCI_converted_cells"].map(
+    lambda x: f"{x:.1f}" if pd.notna(x) else "—"
+)
+
+tbl = ax_f.table(
+    cellText=tbl_df[["reference_year", "new_urban_ha",
+                     "native_to_urban_ha", "mean_NCI_converted_cells"]].values,
+    colLabels=["Ref. year", "New urban (ha)", "Native→urban (ha)", "Mean NCI"],
+    loc="center", cellLoc="center"
+)
+tbl.auto_set_font_size(False)
+tbl.set_fontsize(7.5)
+tbl.scale(1.0, 1.38)
+for (row, col), cell in tbl.get_celld().items():
+    cell.set_edgecolor("#bdbdbd")
+    cell.set_linewidth(0.5)
+    if row == 0:
+        cell.set_facecolor("#f0f0f0")
+        cell.set_text_props(weight="bold")
+ax_f.set_title("Observed conversion accounting by period", loc="left")
+add_panel_label(ax_f, "f")
+
+# ── Panel g — [IMP-2] Decadal urban expansion rates ──────────
+ax_g.bar(decade_df["period"], decade_df["rate_ha_per_yr"],
+         color="#d62728", edgecolor="white", linewidth=0.5, alpha=0.85)
+for i, row in decade_df.iterrows():
+    ax_g.text(i, row["rate_ha_per_yr"] + max(decade_df["rate_ha_per_yr"]) * 0.02,
+              f"{row['rate_ha_per_yr']:.1f}", ha="center", va="bottom", fontsize=8)
+ax_g.set_ylabel("Urban expansion rate (ha / yr)")
+ax_g.set_title("Urban / infrastructure expansion rate by decade", loc="left")
+ax_g.tick_params(axis="x", labelsize=8)
+ax_g.grid(axis="y", linewidth=0.3, alpha=0.5)
+add_panel_label(ax_g, "g")
+
+# ── Panel h — [IMP-3] NCI-exposure trajectory ────────────────
+nci_exp_col_main = f"NCI_exposure_{main_ref}_{TARGET_YEAR}"
+if nci_exp_col_main in observed_gdf.columns:
+    nci_exp_total = observed_gdf[nci_exp_col_main].sum()
+    exp_by_yr = [
+        {"ref_year": ry,
+         "NCI_exp": observed_gdf.get(f"NCI_exposure_{ry}_{TARGET_YEAR}", pd.Series(0)).sum()}
+        for ry in REFERENCE_YEARS
+    ]
+    exp_df = pd.DataFrame(exp_by_yr)
+    ax_h.bar(exp_df["ref_year"].astype(str) + f"–{TARGET_YEAR}", exp_df["NCI_exp"],
+             color="#1d6ba0", edgecolor="white", linewidth=0.5, alpha=0.85)
+    ax_h.set_ylabel("Area-weighted NCI exposure (ha × NCI score)")
+    ax_h.set_title("Cumulative NCI exposure by conversion period", loc="left")
+    ax_h.tick_params(axis="x", labelsize=8)
+    ax_h.grid(axis="y", linewidth=0.3, alpha=0.5)
+else:
+    ax_h.axis("off")
+    ax_h.text(0.5, 0.5, "NCI exposure\nnot available",
+              ha="center", va="center", transform=ax_h.transAxes)
+add_panel_label(ax_h, "h")
+
+# ── Panel i — [IMP-1] Conversion by NCI class ────────────────
+if len(class_conversion) > 0 and "pct_class_converted" in class_conversion.columns:
+    ax_i.bar(
+        class_conversion["NCI_BR_class"].astype(str),
+        class_conversion["pct_class_converted"].fillna(0),
+        color=["#b2182b", "#ef8a62", "#fddbc7", "#74c476", "#1a7a3c"],
+        edgecolor="white", linewidth=0.5
+    )
+    ax_i.set_ylabel("% of class area converted to urban")
+    ax_i.set_title("Urban conversion rate by NCI-BR quintile class", loc="left")
+    ax_i.tick_params(axis="x", labelsize=8)
+    ax_i.grid(axis="y", linewidth=0.3, alpha=0.5)
+else:
+    ax_i.axis("off")
+    ax_i.text(0.5, 0.5, "Class conversion\nnot available",
+              ha="center", va="center", transform=ax_i.transAxes)
+add_panel_label(ax_i, "i")
+
+fig.suptitle(
+    f"Observed urban/infrastructure conversion and NCI-BR exposure — {MUNICIPALITY}, SP",
+    fontsize=13, fontweight="bold", y=0.995
+)
+fig.text(
+    0.02, 0.005,
+    f"Source: MapBiomas Collection 10 | Urban class 24 | "
+    f"Net new urban = class 24 in {TARGET_YEAR} and not class 24 in reference year. "
+    "No synthetic or hypothetical footprints.",
+    fontsize=7.5, color="#4d4d4d"
+)
+
+fig_png = DIRS["figures"] / "figure_07_nci_br_sjc_observed_conversion.png"
+fig_pdf = DIRS["figures"] / "figure_07_nci_br_sjc_observed_conversion.pdf"
+
+plt.savefig(fig_png, dpi=CONFIG["figure_dpi"], bbox_inches="tight")
+plt.savefig(fig_pdf, dpi=CONFIG["figure_dpi"], bbox_inches="tight")
+plt.show()
+
+print(f"\nFigure exported:\n  {fig_png}\n  {fig_pdf}")
+logger.info(f"Figure exported: {fig_png}")
+
+# ------------------------------------------------------------
+# 18. [NEW-1] MD5 checksums
+# ------------------------------------------------------------
+
+def md5_checksum(fp: Path) -> str:
+    h = hashlib.md5()
+    with open(fp, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+checksum_files = [observed_path, observed_csv]
+checksums      = {fp.name: md5_checksum(fp) for fp in checksum_files}
+checksums_path = DIRS["metadata"] / "nci_br_block08_checksums.json"
+with open(checksums_path, "w") as f:
+    json.dump(checksums, f, indent=4)
+print(f"MD5 checksums: {checksums_path}")
+
+# ------------------------------------------------------------
+# 19. Block metadata
+# ------------------------------------------------------------
+
+block08_metadata = {
+    "block":          "08",
+    "version":        "final",
+    "municipality":   MUNICIPALITY,
+    "data_status":    "Observed data only — no synthetic footprints",
+    "reference_years": REFERENCE_YEARS,
+    "target_year":    TARGET_YEAR,
+    "urban_class":    URBAN_CLASS,
+    "transition_def": "new urban = class 24 in target year AND NOT class 24 in reference year",
+    "decadal_rates":  decade_df.to_dict(orient="records"),
+    "outputs": {
+        "observed_gpkg":          str(observed_path),
+        "observed_csv":           str(observed_csv),
+        "summary_csv":            str(summary_path),
+        "annual_trajectory_csv":  str(annual_path),
+        "decadal_rates_csv":      str(decade_path),
+        "class_conversion_csv":   str(class_conv_path),
+        "top_cells_csv":          str(top_cells_path),
+        "figure_png":             str(fig_png),
+        "figure_pdf":             str(fig_pdf),
+        "checksums":              str(checksums_path),
+    },
+    "created_at": datetime.now().isoformat(),
+}
+
+metadata_path = DIRS["metadata"] / "nci_br_block08_metadata.json"
+with open(metadata_path, "w", encoding="utf-8") as f:
+    json.dump(block08_metadata, f, indent=4, ensure_ascii=False)
+print(f"Metadata saved: {metadata_path}")
+logger.info("Block 08 completed.")
+
+# ------------------------------------------------------------
+# 20. Final summary
+# ------------------------------------------------------------
+
+main_row = summary_df[summary_df["reference_year"] == main_ref].iloc[0]
+
+print("\n" + "=" * 62)
+print(f"BLOCK 08 — COMPLETED | {MUNICIPALITY}")
+print("=" * 62)
+print(f"  Analysis period      : {START_YEAR}–{TARGET_YEAR}")
+print(f"  Urban class          : MapBiomas class 24")
+print(f"\n  Observed conversion {main_ref}→{TARGET_YEAR}:")
+print(f"    New urban area     : {main_row['new_urban_ha']:,.0f} ha")
+print(f"    Native → urban     : {main_row['native_to_urban_ha']:,.0f} ha")
+print(f"    Agri. → urban      : {main_row['agri_to_urban_ha']:,.0f} ha")
+print(f"    Affected cells     : {int(main_row['affected_cells'])}")
+print(f"    Mean NCI converted : {main_row['mean_NCI_converted_cells']:.1f}")
+print(f"\n  Decadal rates (ha/yr):")
+for _, r in decade_df.iterrows():
+    print(f"    {r['period']}: {r['rate_ha_per_yr']:+.1f} ha/yr")
+print("=" * 62)
+print("\nNext block: scenario analysis — forward-looking conversion")
+print("accounting under alternative land-use change pathways.")
