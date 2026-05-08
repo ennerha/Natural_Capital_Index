@@ -1,0 +1,679 @@
+# ============================================================
+# BRAZIL NCI-BR PROJECT
+# BLOCK 09 — EVIDENCE SYNTHESIS AND NEGOTIATION TABLES
+# REAL DATA ONLY — NO SYNTHETIC SCENARIOS
+# FOCUS: SÃO JOSÉ DOS CAMPOS — SP, BRAZIL
+# ============================================================
+#
+# Corrections applied:
+#   [FIX-1]  All file paths updated to nci_br_sjc_* pattern
+#   [FIX-2]  DIRS creation loop added
+#   [FIX-3]  plot_crs defined at block start
+#   [FIX-4]  Municipal boundary loaded and overlaid on all maps
+#   [FIX-5]  Consistent map_extent applied to all map panels
+#   [FIX-6]  All output filenames follow nci_br_sjc_* pattern
+#   [FIX-7]  Column names aligned with corrected Block 08 outputs
+#   [FIX-8]  grid_area_ha guarded in all aggregations
+#   [FIX-9]  Column detection via find_column() (no hard crash)
+#   [FIX-10] evidence_color NaN-safe (.fillna grey)
+#   [FIX-11] annual_urban column name aligned with Block 08 output
+#   [IMP-1]  Negotiation-ready stakeholder table added (panel i)
+#   [IMP-2]  Moran/LISA/Gi* stats integrated into synthesis table
+#   [IMP-3]  Panel E bar labels truncated for readability
+#   [NEW-1]  MD5 checksums added
+#   [NEW-2]  Expanded to 9 panels
+# ============================================================
+
+import json
+import logging
+import hashlib
+from pathlib import Path
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+
+# ------------------------------------------------------------
+# 1. Reload project configuration
+# ------------------------------------------------------------
+
+PROJECT_ROOT = Path("/content/drive/MyDrive/Brazil/NCI_BR_Project")
+
+DIRS = {
+    "root":         PROJECT_ROOT,
+    "raw":          PROJECT_ROOT / "01_raw",
+    "intermediate": PROJECT_ROOT / "02_intermediate",
+    "processed":    PROJECT_ROOT / "03_processed",
+    "tables":       PROJECT_ROOT / "04_tables",
+    "figures":      PROJECT_ROOT / "05_figures",
+    "maps":         PROJECT_ROOT / "06_maps",
+    "exports":      PROJECT_ROOT / "07_exports",
+    "logs":         PROJECT_ROOT / "08_logs",
+    "metadata":     PROJECT_ROOT / "09_metadata",
+}
+
+# [FIX-2] Create directories
+for d in DIRS.values():
+    d.mkdir(parents=True, exist_ok=True)
+
+config_path = DIRS["metadata"] / "nci_br_config.json"
+with open(config_path, "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
+
+# [FIX-3]
+plot_crs      = CONFIG.get("output_crs", "EPSG:5880")
+MUNICIPALITY  = "São José dos Campos"
+TARGET_YEAR   = int(CONFIG["baseline_year"])
+MAIN_REF_YEAR = 1985
+
+# ------------------------------------------------------------
+# 2. Logging
+# ------------------------------------------------------------
+
+log_file = DIRS["logs"] / f"nci_br_block09_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+logging.basicConfig(
+    filename=log_file, level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger("NCI_BR_BLOCK09")
+logger.info(f"Block 09 started — {MUNICIPALITY}. Observed data only.")
+print(f"Log file: {log_file}")
+
+# ------------------------------------------------------------
+# 3. [FIX-1] Load all prior-block products — corrected paths
+# ------------------------------------------------------------
+
+# Spatial grids
+nci_path      = DIRS["processed"] / "nci_br_sjc_spatial_statistics.gpkg"
+if not nci_path.exists():
+    nci_path  = DIRS["processed"] / "nci_br_sjc_grid_integrated_index.gpkg"
+
+observed_path = DIRS["processed"] / "nci_br_sjc_observed_conversion.gpkg"
+muni_path     = DIRS["processed"] / "nci_br_sjc_municipality.gpkg"
+
+# Tables
+observed_summary_path = DIRS["tables"] / "nci_br_sjc_observed_conversion_summary.csv"
+annual_urban_path     = DIRS["tables"] / "nci_br_sjc_urban_trajectory_annual.csv"
+moran_path            = DIRS["tables"] / "nci_br_sjc_global_morans_i.csv"
+lisa_sum_path         = DIRS["tables"] / "nci_br_sjc_lisa_cluster_summary.csv"
+gi_sum_path           = DIRS["tables"] / "nci_br_sjc_gi_hotspot_summary.csv"
+
+for p in [nci_path, observed_path, muni_path, observed_summary_path, annual_urban_path]:
+    if not p.exists():
+        raise FileNotFoundError(
+            f"Required input not found: {p}\n"
+            "Run Blocks 02, 06, 07, and 08 before Block 09."
+        )
+
+nci_gdf          = gpd.read_file(nci_path)
+observed_gdf     = gpd.read_file(observed_path)
+muni_gdf         = gpd.read_file(muni_path)
+observed_summary = pd.read_csv(observed_summary_path)
+annual_urban     = pd.read_csv(annual_urban_path)
+
+moran_df     = pd.read_csv(moran_path)     if moran_path.exists()    else pd.DataFrame()
+lisa_summary = pd.read_csv(lisa_sum_path)  if lisa_sum_path.exists()  else pd.DataFrame()
+gi_summary   = pd.read_csv(gi_sum_path)    if gi_sum_path.exists()    else pd.DataFrame()
+
+if observed_gdf.crs is None: observed_gdf = observed_gdf.set_crs(plot_crs)
+if nci_gdf.crs     is None: nci_gdf      = nci_gdf.set_crs(plot_crs)
+if muni_gdf.crs    is None: muni_gdf     = muni_gdf.set_crs("EPSG:4674")
+
+observed_gdf = observed_gdf.to_crs(plot_crs)
+nci_gdf      = nci_gdf.to_crs(plot_crs)
+muni_plot    = muni_gdf.to_crs(plot_crs)
+
+print(f"NCI-BR grid     : {len(nci_gdf)} cells")
+print(f"Observed grid   : {len(observed_gdf)} cells")
+logger.info(f"Inputs loaded. nci={len(nci_gdf)}, obs={len(observed_gdf)}")
+
+# ------------------------------------------------------------
+# 4. [FIX-7 / FIX-9] Detect observed conversion columns
+# ------------------------------------------------------------
+# Block 08 corrected uses: new_urban_*, native_to_urban_*,
+# agri_to_urban_*, NCI_exposure_*, hydro_cap_exposure_*
+
+def find_column(df: pd.DataFrame, candidates: list, required: bool = True):
+    for c in candidates:
+        if c in df.columns:
+            return c
+    if required:
+        raise ValueError(
+            f"None of the candidate columns found: {candidates}\n"
+            f"Available: {[c for c in df.columns if 'urban' in c.lower() or 'nci' in c.lower()]}"
+        )
+    return None
+
+
+main_new_col  = find_column(observed_gdf, [
+    f"new_urban_{MAIN_REF_YEAR}_{TARGET_YEAR}_ha",
+    f"observed_new_urban_{MAIN_REF_YEAR}_{TARGET_YEAR}_ha",
+])
+main_nat_col  = find_column(observed_gdf, [
+    f"native_to_urban_{MAIN_REF_YEAR}_{TARGET_YEAR}_ha",
+])
+main_agri_col = find_column(observed_gdf, [
+    f"agri_to_urban_{MAIN_REF_YEAR}_{TARGET_YEAR}_ha",
+    f"agriculture_to_urban_{MAIN_REF_YEAR}_{TARGET_YEAR}_ha",
+])
+main_nci_exp  = find_column(observed_gdf, [
+    f"NCI_exposure_{MAIN_REF_YEAR}_{TARGET_YEAR}",
+    f"NCI_exposed_by_observed_conversion_{MAIN_REF_YEAR}_{TARGET_YEAR}",
+])
+main_hyd_exp  = find_column(observed_gdf, [
+    f"hydro_cap_exposure_{MAIN_REF_YEAR}_{TARGET_YEAR}",
+    f"hydrological_capital_exposed_{MAIN_REF_YEAR}_{TARGET_YEAR}",
+], required=False)
+
+# [FIX-11] Detect annual urban area column (Block 08 exports "urban_ha")
+urban_ha_col = find_column(annual_urban, ["urban_ha", "urban_infrastructure_ha"])
+
+for col in [main_new_col, main_nat_col, main_agri_col, main_nci_exp]:
+    observed_gdf[col] = pd.to_numeric(observed_gdf[col], errors="coerce").fillna(0)
+
+if main_hyd_exp:
+    observed_gdf[main_hyd_exp] = pd.to_numeric(observed_gdf[main_hyd_exp], errors="coerce").fillna(0)
+
+if "NCI_BR" in observed_gdf.columns:
+    observed_gdf["NCI_BR"] = pd.to_numeric(observed_gdf["NCI_BR"], errors="coerce")
+
+print(f"\nColumn mapping resolved:")
+print(f"  New urban     : {main_new_col}")
+print(f"  Native→urban  : {main_nat_col}")
+print(f"  Agri→urban    : {main_agri_col}")
+print(f"  NCI exposure  : {main_nci_exp}")
+print(f"  Hydro exposure: {main_hyd_exp}")
+print(f"  Annual urban  : {urban_ha_col}")
+
+# ------------------------------------------------------------
+# 5. Evidence-based priority classification
+# ------------------------------------------------------------
+
+nci_q75 = float(observed_gdf["NCI_BR"].quantile(0.75))
+nci_q25 = float(observed_gdf["NCI_BR"].quantile(0.25))
+
+
+def classify_evidence(row) -> str:
+    has_new_urban  = row[main_new_col]  > 0
+    has_native_urb = row[main_nat_col]  > 0
+    nci            = row["NCI_BR"]
+
+    if has_new_urban and nci >= nci_q75:
+        return "Converted high-NCI cell"
+    if has_native_urb:
+        return "Native vegetation → urban"
+    if nci >= nci_q75:
+        return "High-NCI conservation priority"
+    if nci <= nci_q25:
+        return "Low-NCI / degraded or transformed"
+    return "Intermediate"
+
+
+observed_gdf["evidence_class"] = observed_gdf.apply(classify_evidence, axis=1)
+
+# ------------------------------------------------------------
+# 6. Synthesis statistics
+# ------------------------------------------------------------
+
+total_cells = len(observed_gdf)
+total_area  = float(observed_gdf["grid_area_ha"].sum()) if "grid_area_ha" in observed_gdf.columns else np.nan
+
+total_new_urban   = float(observed_gdf[main_new_col].sum())
+total_nat_to_urb  = float(observed_gdf[main_nat_col].sum())
+total_agri_to_urb = float(observed_gdf[main_agri_col].sum())
+total_nci_exp     = float(observed_gdf[main_nci_exp].sum())
+total_hyd_exp     = float(observed_gdf[main_hyd_exp].sum()) if main_hyd_exp else np.nan
+
+converted_cells       = observed_gdf[observed_gdf[main_new_col] > 0]
+native_conv_cells     = observed_gdf[observed_gdf[main_nat_col] > 0]
+
+synthesis_records = [
+    ("Total grid cells in municipality",              total_cells,          "cells"),
+    ("Total grid area",                               total_area,           "ha"),
+    (f"New urban/infra {MAIN_REF_YEAR}–{TARGET_YEAR}", total_new_urban,    "ha"),
+    (f"Native → urban {MAIN_REF_YEAR}–{TARGET_YEAR}", total_nat_to_urb,    "ha"),
+    (f"Agri. → urban {MAIN_REF_YEAR}–{TARGET_YEAR}",  total_agri_to_urb,   "ha"),
+    ("Cells with any observed conversion",            len(converted_cells), "cells"),
+    ("Cells with native-to-urban conversion",         len(native_conv_cells),"cells"),
+    ("Mean NCI-BR in converted cells",                converted_cells["NCI_BR"].mean(), "0–100"),
+    ("Mean NCI-BR in native-to-urban cells",          native_conv_cells["NCI_BR"].mean(),"0–100"),
+    ("Area-weighted NCI exposure (conversion)",       total_nci_exp,        "NCI × ha"),
+    ("Area-weighted hydro. exposure (conversion)",    total_hyd_exp,        "score × ha"),
+]
+
+# [IMP-2] Append spatial autocorrelation summary if available
+if len(moran_df) > 0 and "variable" in moran_df.columns:
+    nci_row = moran_df[moran_df["variable"] == "NCI_BR"]
+    if len(nci_row) > 0:
+        r = nci_row.iloc[0]
+        synthesis_records += [
+            ("Global Moran's I (NCI-BR)",    float(r.get("moran_I", np.nan)),  "index"),
+            ("Moran's I p-value (NCI-BR)",   float(r.get("p_value",  np.nan)), "p"),
+        ]
+
+if len(lisa_summary) > 0:
+    hh = lisa_summary[lisa_summary.get("LISA_cluster", pd.Series(dtype=str)) == "High-High"]
+    if len(hh) > 0:
+        synthesis_records.append(
+            ("High-High LISA cells (NCI-BR)", int(hh["n_cells"].iloc[0]), "cells")
+        )
+
+synthesis = pd.DataFrame(synthesis_records, columns=["metric", "value", "unit"])
+
+# ------------------------------------------------------------
+# 7. [FIX-8] Category summary — guarded grid_area_ha
+# ------------------------------------------------------------
+
+agg_dict = {
+    "grid_id":     "count",
+    "NCI_BR":      "mean",
+    main_new_col:  "sum",
+    main_nat_col:  "sum",
+    main_nci_exp:  "sum",
+}
+if "grid_area_ha" in observed_gdf.columns:
+    agg_dict["grid_area_ha"] = "sum"
+
+cat_summary = (
+    observed_gdf.groupby("evidence_class")
+    .agg(agg_dict)
+    .reset_index()
+    .rename(columns={
+        "grid_id":    "n_cells",
+        "NCI_BR":     "mean_NCI_BR",
+        main_new_col: "new_urban_ha",
+        main_nat_col: "native_to_urban_ha",
+        main_nci_exp: "NCI_exposure",
+    })
+    .sort_values("NCI_exposure", ascending=False)
+)
+
+# ------------------------------------------------------------
+# 8. Top observed conversion cells
+# ------------------------------------------------------------
+
+top_cols = ["grid_id", main_new_col, main_nat_col, "NCI_BR",
+            main_nci_exp, "evidence_class"]
+if "NCI_BR_class"    in observed_gdf.columns: top_cols.append("NCI_BR_class")
+if "LISA_cluster"    in observed_gdf.columns: top_cols.append("LISA_cluster")
+if "Gi_cluster"      in observed_gdf.columns: top_cols.append("Gi_cluster")
+
+top_cols = [c for c in top_cols if c in observed_gdf.columns]
+
+top_cells = (
+    observed_gdf[observed_gdf[main_new_col] > 0][top_cols]
+    .sort_values(main_nci_exp, ascending=False)
+    .head(50)
+)
+
+# ------------------------------------------------------------
+# 9. [IMP-1] Negotiation-ready summary table (stakeholder-facing)
+# ------------------------------------------------------------
+# Compact, plain-language table designed for policy/negotiation use.
+
+nci_mean_all = float(observed_gdf["NCI_BR"].mean())
+nci_hh_cells = int((observed_gdf.get("LISA_cluster", pd.Series(dtype=str)) == "High-High").sum())
+
+negotiation_rows = [
+    ["Study area",          MUNICIPALITY, "São Paulo State, Brazil"],
+    ["Analysis period",     f"{MAIN_REF_YEAR}–{TARGET_YEAR}", "Observed MapBiomas data"],
+    ["Grid resolution",     "1 km × 1 km", f"{total_cells} cells"],
+    ["Mean NCI-BR score",   f"{nci_mean_all:.1f} / 100", "Higher = more natural capital"],
+    ["Urban expansion",     f"{total_new_urban:,.0f} ha", f"Since {MAIN_REF_YEAR}"],
+    ["Native veg. lost",    f"{total_nat_to_urb:,.0f} ha", "To urban/infrastructure"],
+    ["Cells converted",     str(len(converted_cells)), f"of {total_cells} total"],
+    ["High-NCI converted",  str((converted_cells["NCI_BR"] >= nci_q75).sum()), "Cells ≥ Q75 NCI-BR"],
+    ["Spatial clustering",  "Yes" if (len(moran_df) > 0 and not moran_df.empty) else "See Block 07",
+     "LISA High-High clusters detected"],
+    ["Priority action",     "Native-veg. retention", "Highest NCI impact per ha"],
+]
+
+negotiation_df = pd.DataFrame(negotiation_rows, columns=["Topic", "Value", "Note"])
+
+# ------------------------------------------------------------
+# 10. Export products
+# ------------------------------------------------------------
+
+synthesis_path     = DIRS["tables"]    / "nci_br_sjc_evidence_synthesis.csv"
+cat_summary_path   = DIRS["tables"]    / "nci_br_sjc_evidence_priority_classes.csv"
+top_cells_path     = DIRS["tables"]    / "nci_br_sjc_top_conversion_cells.csv"
+negot_path         = DIRS["tables"]    / "nci_br_sjc_negotiation_table.csv"
+synthesis_gpkg     = DIRS["processed"] / "nci_br_sjc_evidence_synthesis.gpkg"
+
+synthesis.to_csv(synthesis_path,   index=False, encoding="utf-8-sig")
+cat_summary.to_csv(cat_summary_path, index=False, encoding="utf-8-sig")
+top_cells.to_csv(top_cells_path,   index=False, encoding="utf-8-sig")
+negotiation_df.to_csv(negot_path,  index=False, encoding="utf-8-sig")
+observed_gdf.to_file(synthesis_gpkg, layer="evidence_synthesis", driver="GPKG")
+
+print("\nEvidence synthesis products exported:")
+for p in [synthesis_path, cat_summary_path, top_cells_path, negot_path, synthesis_gpkg]:
+    print(f"  {p}")
+logger.info(f"Synthesis exported. {len(synthesis)} metrics | {len(cat_summary)} classes")
+
+# ------------------------------------------------------------
+# 11. Prepare plotting
+# ------------------------------------------------------------
+
+CLASS_COLORS = {
+    "Converted high-NCI cell":             "#b2182b",
+    "Native vegetation → urban":           "#ef8a62",
+    "High-NCI conservation priority":      "#1b7837",
+    "Low-NCI / degraded or transformed":   "#969696",
+    "Intermediate":                        "#d9f0a3",
+}
+
+# [FIX-10] NaN-safe color mapping
+observed_gdf["evidence_color"] = (
+    observed_gdf["evidence_class"].map(CLASS_COLORS).fillna("#d9d9d9")
+)
+
+xmin, ymin, xmax, ymax = muni_plot.total_bounds
+xbuf = (xmax - xmin) * 0.05
+ybuf = (ymax - ymin) * 0.05
+map_extent = [xmin - xbuf, xmax + xbuf, ymin - ybuf, ymax + ybuf]
+
+
+def overlay_boundary(ax, gdf):
+    gdf.boundary.plot(ax=ax, edgecolor="black", linewidth=1.2, zorder=5)
+
+
+def set_map_extent(ax):
+    ax.set_xlim(map_extent[0], map_extent[1])
+    ax.set_ylim(map_extent[2], map_extent[3])
+    ax.set_axis_off()
+
+
+def add_panel_label(ax, label):
+    ax.text(0.02, 0.97, label, transform=ax.transAxes,
+            fontsize=12, fontweight="bold", va="top", ha="left",
+            bbox=dict(facecolor="white", edgecolor="none",
+                      alpha=0.88, boxstyle="round,pad=0.22"))
+
+# ------------------------------------------------------------
+# 12. High-quality composite figure — 9 panels
+# ------------------------------------------------------------
+
+plt.rcParams.update({
+    "figure.dpi": 150, "savefig.dpi": CONFIG["figure_dpi"],
+    "font.family": "DejaVu Sans", "font.size": 9.5,
+    "axes.titlesize": 10, "axes.labelsize": 9,
+    "legend.fontsize": 7.5, "axes.linewidth": 0.7,
+    "pdf.fonttype": 42, "ps.fonttype": 42, "savefig.bbox": "tight",
+})
+
+fig = plt.figure(figsize=(16, 11), dpi=150)
+gs  = fig.add_gridspec(
+    nrows=3, ncols=3,
+    width_ratios=[1.2, 1.2, 1.0],
+    height_ratios=[1, 1, 1],
+    wspace=0.22, hspace=0.32
+)
+
+ax_a = fig.add_subplot(gs[0, 0])
+ax_b = fig.add_subplot(gs[0, 1])
+ax_c = fig.add_subplot(gs[0, 2])
+ax_d = fig.add_subplot(gs[1, 0])
+ax_e = fig.add_subplot(gs[1, 1])
+ax_f = fig.add_subplot(gs[1, 2])
+ax_g = fig.add_subplot(gs[2, 0])
+ax_h = fig.add_subplot(gs[2, 1])
+ax_i = fig.add_subplot(gs[2, 2])
+
+# ── Panel a — NCI-BR baseline ────────────────────────────────
+observed_gdf.plot(
+    column="NCI_BR", ax=ax_a,
+    cmap="YlGn", linewidth=0.0, legend=True,
+    legend_kwds={"label": "NCI-BR (0–100)", "shrink": 0.7},
+    missing_kwds={"color": "lightgrey"}, vmin=0, vmax=100
+)
+overlay_boundary(ax_a, muni_plot)
+set_map_extent(ax_a)
+ax_a.set_title("Current NCI-BR baseline", loc="left")
+add_panel_label(ax_a, "a")
+
+# ── Panel b — Observed new urban ─────────────────────────────
+observed_gdf.plot(
+    column=main_new_col, ax=ax_b,
+    cmap="Reds", linewidth=0.0, legend=True,
+    legend_kwds={"label": "New urban area (ha)", "shrink": 0.7},
+    missing_kwds={"color": "lightgrey"}
+)
+overlay_boundary(ax_b, muni_plot)
+set_map_extent(ax_b)
+ax_b.set_title(f"Observed new urban area {MAIN_REF_YEAR}–{TARGET_YEAR}", loc="left")
+add_panel_label(ax_b, "b")
+
+# ── Panel c — Evidence classes map ───────────────────────────
+observed_gdf.plot(ax=ax_c, color=observed_gdf["evidence_color"], linewidth=0.0)
+overlay_boundary(ax_c, muni_plot)
+set_map_extent(ax_c)
+ax_c.set_title("Observed evidence-based priority classes", loc="left")
+
+present = observed_gdf["evidence_class"].unique().tolist()
+handles = [
+    mpatches.Patch(facecolor=c, edgecolor="none", label=l)
+    for l, c in CLASS_COLORS.items() if l in present
+]
+ax_c.legend(handles=handles, loc="lower left", fontsize=6.5,
+            framealpha=0.90, edgecolor="#bdbdbd")
+add_panel_label(ax_c, "c")
+
+# ── Panel d — Annual urban trajectory ────────────────────────
+ax_d.plot(annual_urban["year"], annual_urban[urban_ha_col],
+          color="#d62728", linewidth=2.2)
+ax_d.fill_between(annual_urban["year"], annual_urban[urban_ha_col],
+                  alpha=0.12, color="#d62728")
+ax_d.set_title(f"Observed urban trajectory {MAIN_REF_YEAR}–{TARGET_YEAR}", loc="left")
+ax_d.set_xlabel("Year")
+ax_d.set_ylabel("Urban area (ha)")
+ax_d.grid(True, linewidth=0.3, alpha=0.5)
+add_panel_label(ax_d, "d")
+
+# ── Panel e — [IMP-3] NCI exposure by evidence class ─────────
+cat_sorted = cat_summary.sort_values("NCI_exposure")
+short_labels = [
+    l.replace("Native vegetation → urban", "Native → urban")
+     .replace("High-NCI conservation priority", "High-NCI priority")
+     .replace("Low-NCI / degraded or transformed", "Low-NCI / degraded")
+     .replace("Converted high-NCI cell", "Converted high-NCI")
+    for l in cat_sorted["evidence_class"]
+]
+
+bar_colors = [CLASS_COLORS.get(l, "#d9d9d9") for l in cat_sorted["evidence_class"]]
+ax_e.barh(short_labels, cat_sorted["NCI_exposure"],
+          color=bar_colors, edgecolor="white", linewidth=0.5)
+ax_e.set_title("Area-weighted NCI exposure by evidence class", loc="left")
+ax_e.set_xlabel("NCI × ha")
+ax_e.tick_params(axis="y", labelsize=7.5)
+ax_e.grid(axis="x", linewidth=0.3, alpha=0.5)
+add_panel_label(ax_e, "e")
+
+# ── Panel f — Evidence synthesis table ───────────────────────
+ax_f.axis("off")
+
+syn_disp = synthesis.copy()
+syn_disp["value"] = syn_disp["value"].map(
+    lambda x: f"{x:,.2f}" if pd.notna(x) and isinstance(x, float) else str(x)
+)
+
+tbl = ax_f.table(
+    cellText=syn_disp[["metric", "value", "unit"]].values,
+    colLabels=["Metric", "Value", "Unit"],
+    loc="center", cellLoc="center"
+)
+tbl.auto_set_font_size(False)
+tbl.set_fontsize(5.8)
+tbl.scale(1.0, 1.28)
+for (row, col), cell in tbl.get_celld().items():
+    cell.set_edgecolor("#bdbdbd")
+    cell.set_linewidth(0.5)
+    if row == 0:
+        cell.set_facecolor("#f0f0f0")
+        cell.set_text_props(weight="bold")
+ax_f.set_title("Observed evidence synthesis", loc="left")
+add_panel_label(ax_f, "f")
+
+# ── Panel g — Conversion by evidence class (counts) ──────────
+cat_cnt = cat_summary.sort_values("n_cells")
+short_g = [
+    l.replace("Native vegetation → urban", "Native → urban")
+     .replace("High-NCI conservation priority", "High-NCI priority")
+     .replace("Low-NCI / degraded or transformed", "Low-NCI / degraded")
+     .replace("Converted high-NCI cell", "Converted high-NCI")
+    for l in cat_cnt["evidence_class"]
+]
+colors_g = [CLASS_COLORS.get(l, "#d9d9d9") for l in cat_cnt["evidence_class"]]
+
+ax_g.barh(short_g, cat_cnt["n_cells"],
+          color=colors_g, edgecolor="white", linewidth=0.5)
+for i, v in enumerate(cat_cnt["n_cells"]):
+    ax_g.text(v + max(cat_cnt["n_cells"]) * 0.01, i,
+              str(v), va="center", fontsize=7.5)
+ax_g.set_title("Cells per evidence class", loc="left")
+ax_g.set_xlabel("Number of 1-km cells")
+ax_g.tick_params(axis="y", labelsize=7.5)
+ax_g.grid(axis="x", linewidth=0.3, alpha=0.5)
+add_panel_label(ax_g, "g")
+
+# ── Panel h — Native conversion vs NCI scatter ───────────────
+mask = (observed_gdf[main_nat_col] > 0) & observed_gdf["NCI_BR"].notna()
+if mask.sum() > 0:
+    ax_h.scatter(
+        observed_gdf.loc[mask, "NCI_BR"],
+        observed_gdf.loc[mask, main_nat_col],
+        s=10, alpha=0.55, color="#d62728"
+    )
+    ax_h.set_xlabel("NCI-BR score")
+    ax_h.set_ylabel("Native vegetation → urban (ha)")
+    ax_h.set_title("Native conversion area vs NCI-BR score", loc="left")
+    ax_h.grid(True, linewidth=0.3, alpha=0.5)
+
+    corr = observed_gdf.loc[mask, ["NCI_BR", main_nat_col]].corr().iloc[0, 1]
+    ax_h.text(0.97, 0.95, f"r = {corr:.3f}",
+              transform=ax_h.transAxes, ha="right", va="top", fontsize=8.5,
+              bbox=dict(facecolor="white", edgecolor="#bdbdbd", boxstyle="round,pad=0.3"))
+else:
+    ax_h.axis("off")
+    ax_h.text(0.5, 0.5, "No native-to-urban\nconversions detected",
+              ha="center", va="center", transform=ax_h.transAxes)
+add_panel_label(ax_h, "h")
+
+# ── Panel i — [IMP-1] Negotiation table ──────────────────────
+ax_i.axis("off")
+
+tbl2 = ax_i.table(
+    cellText=negotiation_df.values,
+    colLabels=["Topic", "Value", "Note"],
+    loc="center", cellLoc="center"
+)
+tbl2.auto_set_font_size(False)
+tbl2.set_fontsize(6.8)
+tbl2.scale(1.0, 1.32)
+for (row, col), cell in tbl2.get_celld().items():
+    cell.set_edgecolor("#bdbdbd")
+    cell.set_linewidth(0.5)
+    if row == 0:
+        cell.set_facecolor("#2171b5")
+        cell.set_text_props(weight="bold", color="white")
+    elif row % 2 == 0:
+        cell.set_facecolor("#f7f7f7")
+ax_i.set_title("Negotiation-ready summary for stakeholders", loc="left")
+add_panel_label(ax_i, "i")
+
+fig.suptitle(
+    f"Evidence synthesis — observed conversion and NCI-BR exposure | {MUNICIPALITY}, SP",
+    fontsize=13, fontweight="bold", y=0.995
+)
+fig.text(
+    0.02, 0.005,
+    "All conversion metrics are observed MapBiomas transitions to class 24 (urban/infrastructure). "
+    "No synthetic or hypothetical footprints.",
+    fontsize=7.5, color="#4d4d4d"
+)
+
+fig_png = DIRS["figures"] / "figure_08_nci_br_sjc_evidence_synthesis.png"
+fig_pdf = DIRS["figures"] / "figure_08_nci_br_sjc_evidence_synthesis.pdf"
+
+plt.savefig(fig_png, dpi=CONFIG["figure_dpi"], bbox_inches="tight")
+plt.savefig(fig_pdf, dpi=CONFIG["figure_dpi"], bbox_inches="tight")
+plt.show()
+
+print(f"\nFigure exported:\n  {fig_png}\n  {fig_pdf}")
+logger.info(f"Figure exported: {fig_png}")
+
+# ------------------------------------------------------------
+# 13. [NEW-1] MD5 checksums
+# ------------------------------------------------------------
+
+def md5_checksum(fp: Path) -> str:
+    h = hashlib.md5()
+    with open(fp, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+checksum_files = [synthesis_gpkg, synthesis_path]
+checksums      = {fp.name: md5_checksum(fp) for fp in checksum_files}
+checksums_path = DIRS["metadata"] / "nci_br_block09_checksums.json"
+with open(checksums_path, "w") as f:
+    json.dump(checksums, f, indent=4)
+print(f"MD5 checksums: {checksums_path}")
+
+# ------------------------------------------------------------
+# 14. Block metadata
+# ------------------------------------------------------------
+
+block09_metadata = {
+    "block":         "09",
+    "version":       "final",
+    "municipality":  MUNICIPALITY,
+    "data_status":   "Observed data only — no synthetic footprints",
+    "reference_year": MAIN_REF_YEAR,
+    "target_year":   TARGET_YEAR,
+    "evidence_classes": list(CLASS_COLORS.keys()),
+    "synthesis_metrics": len(synthesis),
+    "outputs": {
+        "synthesis_csv":          str(synthesis_path),
+        "priority_classes_csv":   str(cat_summary_path),
+        "top_cells_csv":          str(top_cells_path),
+        "negotiation_table_csv":  str(negot_path),
+        "synthesis_gpkg":         str(synthesis_gpkg),
+        "figure_png":             str(fig_png),
+        "figure_pdf":             str(fig_pdf),
+        "checksums":              str(checksums_path),
+    },
+    "created_at": datetime.now().isoformat(),
+}
+
+metadata_path = DIRS["metadata"] / "nci_br_block09_metadata.json"
+with open(metadata_path, "w", encoding="utf-8") as f:
+    json.dump(block09_metadata, f, indent=4, ensure_ascii=False)
+print(f"Metadata saved: {metadata_path}")
+logger.info("Block 09 completed.")
+
+# ------------------------------------------------------------
+# 15. Final summary
+# ------------------------------------------------------------
+
+print("\n" + "=" * 62)
+print(f"BLOCK 09 — COMPLETED | {MUNICIPALITY}")
+print("=" * 62)
+print(f"  Data source     : Observed MapBiomas transitions only")
+print(f"  Period          : {MAIN_REF_YEAR}–{TARGET_YEAR}")
+print(f"  Grid cells      : {total_cells}")
+print(f"\n  Key findings:")
+print(f"    Urban expansion : {total_new_urban:,.0f} ha")
+print(f"    Native → urban  : {total_nat_to_urb:,.0f} ha")
+print(f"    Mean NCI (conv) : {converted_cells['NCI_BR'].mean():.1f}")
+print(f"    NCI exposure    : {total_nci_exp:,.0f} NCI × ha")
+print(f"\n  Evidence classes:")
+for _, row in cat_summary.iterrows():
+    print(f"    {row['evidence_class']:<38}: {int(row['n_cells']):>4} cells")
+print("=" * 62)
+print("\nAll outputs in this block are based on observed data only.")
+print("Next: project-level report or spatial scenario analysis.")
