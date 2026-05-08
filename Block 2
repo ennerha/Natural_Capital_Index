@@ -1,0 +1,805 @@
+# ============================================================
+# BRAZIL NCI-BR PROJECT
+# BLOCK 02 — STUDY AREA, SPATIAL UNITS, GRID, BASE FIGURE
+# FOCUS: SÃO JOSÉ DOS CAMPOS — SP, BRAZIL
+# ============================================================
+
+import io
+import json
+import hashlib
+import logging
+import zipfile
+import requests
+from pathlib import Path
+from datetime import datetime
+from shapely.geometry import box, mapping
+
+import ee
+import geemap
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import matplotlib.patheffects as pe
+import matplotlib.patches as mpatches
+import rasterio
+from rasterio.mask import mask as rio_mask
+
+# ------------------------------------------------------------
+# 1. Reload project configuration
+# ------------------------------------------------------------
+
+PROJECT_ROOT = Path("/content/drive/MyDrive/Brazil/NCI_BR_Project")
+
+DIRS = {
+    "root":         PROJECT_ROOT,
+    "raw":          PROJECT_ROOT / "01_raw",
+    "intermediate": PROJECT_ROOT / "02_intermediate",
+    "processed":    PROJECT_ROOT / "03_processed",
+    "tables":       PROJECT_ROOT / "04_tables",
+    "figures":      PROJECT_ROOT / "05_figures",
+    "maps":         PROJECT_ROOT / "06_maps",
+    "exports":      PROJECT_ROOT / "07_exports",
+    "logs":         PROJECT_ROOT / "08_logs",
+    "metadata":     PROJECT_ROOT / "09_metadata",
+}
+
+for d in DIRS.values():
+    d.mkdir(parents=True, exist_ok=True)
+
+config_path = DIRS["metadata"] / "nci_br_config.json"
+with open(config_path, "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
+
+plot_crs = CONFIG.get("output_crs", "EPSG:5880")
+
+# ------------------------------------------------------------
+# 2. Logging
+# ------------------------------------------------------------
+
+log_file = DIRS["logs"] / f"nci_br_block02_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+logging.basicConfig(
+    filename=log_file,
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger("NCI_BR_BLOCK02")
+logger.info("Block 02 started — focus: Sao Jose dos Campos.")
+print(f"Log file: {log_file}")
+
+# ------------------------------------------------------------
+# 3. Earth Engine initialization
+# ------------------------------------------------------------
+
+try:
+    ee.Initialize(project=CONFIG["gee_project_id"])
+    print("Google Earth Engine initialized.")
+except Exception:
+    ee.Authenticate()
+    ee.Initialize(project=CONFIG["gee_project_id"])
+    print("Google Earth Engine initialized after authentication.")
+
+# ------------------------------------------------------------
+# 4. Load municipal boundary — automatic source cascade
+# ------------------------------------------------------------
+# Three sources attempted in order. The first to succeed is used.
+# Source 1: IBGE Malhas API  (~2 s, highest fidelity)
+# Source 2: IBGE FTP shapefile for São Paulo state (~60 s)
+# Source 3: GADM v4.1 public GEE asset (offline fallback)
+
+MUNICIPALITY = "São José dos Campos"
+IBGE_CODE    = 3549904
+STATE_CODE   = "SP"
+
+# ── Source 1: IBGE Malhas API ────────────────────────────────
+
+def load_from_ibge_api(code: int, name: str, raw_dir: Path,
+                        timeout: int = 30) -> gpd.GeoDataFrame:
+    """Download municipal polygon from the IBGE Malhas v3 API."""
+    url = (
+        f"https://servicodados.ibge.gov.br/api/v3/malhas/municipios"
+        f"/{code}?formato=application/json&qualidade=maxima"
+    )
+    print(f"    Downloading {name} (code {code}) from IBGE API...")
+    resp = requests.get(url, timeout=timeout)
+    resp.raise_for_status()
+
+    gdf = gpd.read_file(io.BytesIO(resp.content))
+    gdf["NM_MUN"]   = name
+    gdf["CD_MUN"]   = str(code)
+    gdf["SIGLA_UF"] = STATE_CODE
+    gdf["source"]   = "ibge_api_malhas_v3"
+
+    out = raw_dir / f"ibge_muni_{code}.geojson"
+    gdf.to_file(out, driver="GeoJSON")
+
+    if gdf.crs is None or gdf.crs.to_epsg() != 4326:
+        gdf = gdf.set_crs("EPSG:4326")
+    return gdf.to_crs("EPSG:4674")
+
+
+# ── Source 2: IBGE FTP — full São Paulo state shapefile ──────
+
+def load_from_ibge_ftp(code: int, name: str, raw_dir: Path,
+                        timeout: int = 120) -> gpd.GeoDataFrame:
+    """Download the SP state shapefile and filter by IBGE code."""
+    url = (
+        "https://geoftp.ibge.gov.br/organizacao_do_territorio/"
+        "malhas_territoriais/malhas_municipais/municipio_2022/"
+        "UFs/SP/SP_Municipios_2022.zip"
+    )
+    print("    Downloading SP shapefile from IBGE FTP (~60 s)...")
+    resp = requests.get(url, timeout=timeout)
+    resp.raise_for_status()
+
+    zip_path = raw_dir / "SP_Municipios_2022.zip"
+    with open(zip_path, "wb") as f:
+        f.write(resp.content)
+
+    extract_dir = raw_dir / "SP_Municipios_2022"
+    extract_dir.mkdir(exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as z:
+        z.extractall(extract_dir)
+
+    shp_files = list(extract_dir.glob("*.shp"))
+    if not shp_files:
+        raise FileNotFoundError("No .shp found in IBGE FTP ZIP.")
+
+    sp_gdf = gpd.read_file(shp_files[0]).to_crs("EPSG:4674")
+
+    code_col = next(
+        (c for c in sp_gdf.columns if "CD_MUN" in c.upper() or "GEOCMU" in c.upper()),
+        None
+    )
+    if code_col is None:
+        raise KeyError(f"Code column not found. Available: {sp_gdf.columns.tolist()}")
+
+    result = sp_gdf[sp_gdf[code_col].astype(str) == str(code)].copy()
+    if len(result) == 0:
+        raise ValueError(f"Municipality code {code} not found in SP shapefile.")
+
+    result["NM_MUN"] = name
+    result["source"] = "ibge_ftp_sp_municipios_2022"
+    return result
+
+
+# ── Source 3: GADM v4.1 public GEE asset ─────────────────────
+
+def load_from_gadm_gee(name: str) -> tuple:
+    """Load municipal polygon from the public GADM v4.1 GEE asset."""
+    gadm = ee.FeatureCollection("projects/sat-io/open-geodata/GADM/gadm41_BRA_2")
+    fc   = gadm.filter(ee.Filter.eq("NAME_2", name))
+
+    gdf = geemap.ee_to_gdf(fc)
+    if gdf.crs is None:
+        gdf = gdf.set_crs("EPSG:4326")
+    gdf = gdf.to_crs("EPSG:4674")
+    gdf["NM_MUN"]   = name
+    gdf["SIGLA_UF"] = STATE_CODE
+    gdf["source"]   = "gadm_v41_gee_level2"
+    return fc, gdf
+
+
+# ── Cascade execution ─────────────────────────────────────────
+
+muni_gdf    = None
+muni_ee     = None
+load_source = None
+
+print(f"\nLoading municipal boundary: {MUNICIPALITY}...")
+
+try:
+    print("  [1/3] IBGE Malhas API v3...")
+    muni_gdf    = load_from_ibge_api(IBGE_CODE, MUNICIPALITY, DIRS["raw"])
+    load_source = "ibge_api"
+    print("  Success.")
+
+except Exception as e1:
+    print(f"  Failed: {e1}")
+    try:
+        print("  [2/3] IBGE FTP (SP shapefile)...")
+        muni_gdf    = load_from_ibge_ftp(IBGE_CODE, MUNICIPALITY, DIRS["raw"])
+        load_source = "ibge_ftp"
+        print("  Success.")
+
+    except Exception as e2:
+        print(f"  Failed: {e2}")
+        try:
+            print("  [3/3] GADM v4.1 via public GEE asset...")
+            muni_ee, muni_gdf = load_from_gadm_gee(MUNICIPALITY)
+            load_source       = "gadm_gee"
+            print("  Success.")
+
+        except Exception as e3:
+            raise RuntimeError(
+                "All boundary sources failed.\n"
+                f"  [1] IBGE API : {e1}\n"
+                f"  [2] IBGE FTP : {e2}\n"
+                f"  [3] GADM GEE : {e3}"
+            )
+
+# ── Validation ────────────────────────────────────────────────
+
+if len(muni_gdf) == 0:
+    raise ValueError("Empty GeoDataFrame after loading.")
+if "NM_MUN" not in muni_gdf.columns:
+    raise KeyError("Column NM_MUN missing.")
+
+# Keep single feature if source returned more than one
+if len(muni_gdf) > 1:
+    muni_gdf = gpd.GeoDataFrame(
+        [muni_gdf.iloc[0]], geometry="geometry", crs=muni_gdf.crs
+    )
+
+print(f"\n  Source used  : {load_source}")
+print(f"  CRS          : {muni_gdf.crs}")
+print(f"  Municipality : {muni_gdf['NM_MUN'].iloc[0]}")
+
+logger.info(f"Boundary loaded via: {load_source} | Municipality: {MUNICIPALITY}")
+
+# ------------------------------------------------------------
+# 5. Compute area and create GEE objects
+# ------------------------------------------------------------
+
+muni_equal    = muni_gdf.to_crs(plot_crs)
+muni_area_km2 = float(muni_equal.geometry.area.iloc[0] / 1e6)
+muni_area_ha  = float(muni_equal.geometry.area.iloc[0] / 1e4)
+
+muni_gdf["area_km2"] = muni_area_km2
+muni_gdf["area_ha"]  = muni_area_ha
+
+print(f"\n  Area: {muni_area_km2:,.2f} km² | {muni_area_ha:,.0f} ha")
+# Expected: São José dos Campos ~1,099 km²
+
+if muni_ee is None:
+    muni_ee = geemap.geopandas_to_ee(muni_gdf.to_crs("EPSG:4326"))
+
+aoi_ee   = muni_ee.geometry()
+aoi_geom = aoi_ee   # alias used in subsequent blocks
+
+n_test = muni_ee.size().getInfo()
+print(f"  GEE FeatureCollection confirmed: {n_test} feature(s)")
+
+logger.info(f"Area: {muni_area_km2:.2f} km²")
+
+# ------------------------------------------------------------
+# 6. Geometry validation
+# ------------------------------------------------------------
+
+muni_gdf["is_valid"] = muni_gdf.geometry.is_valid
+
+if not muni_gdf["is_valid"].all():
+    print("Invalid geometry detected — fixing with buffer(0).")
+    muni_gdf["geometry"] = muni_gdf.geometry.buffer(0)
+    muni_gdf["is_valid"] = muni_gdf.geometry.is_valid
+
+if not muni_gdf["is_valid"].all():
+    raise ValueError("Geometry remains invalid after repair.")
+
+print("Geometry validation: OK")
+
+# ------------------------------------------------------------
+# 7. Export boundary files
+# ------------------------------------------------------------
+
+gpkg_path    = DIRS["processed"] / "nci_br_sjc_municipality.gpkg"
+geojson_path = DIRS["processed"] / "nci_br_sjc_municipality.geojson"
+csv_path     = DIRS["tables"]    / "nci_br_sjc_area_summary.csv"
+
+muni_gdf.to_file(gpkg_path, layer="sjc_municipality", driver="GPKG")
+muni_gdf.to_crs("EPSG:4326").to_file(geojson_path, driver="GeoJSON")
+
+area_summary = pd.DataFrame([{
+    "municipality": MUNICIPALITY,
+    "ibge_code":    IBGE_CODE,
+    "state":        STATE_CODE,
+    "area_km2":     round(muni_area_km2, 4),
+    "area_ha":      round(muni_area_ha,  2),
+    "source":       load_source,
+}])
+area_summary.to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+print("\nBoundary files exported:")
+for p in [gpkg_path, geojson_path, csv_path]:
+    print(f"  {p}")
+
+# ------------------------------------------------------------
+# 8. Analytical 1-km grid — clipped to municipal boundary
+# ------------------------------------------------------------
+
+def create_square_grid(
+    gdf: gpd.GeoDataFrame,
+    cell_size_m: int = 1000,
+    crs_projected: str = "EPSG:5880"
+) -> gpd.GeoDataFrame:
+    """
+    Create a regular square grid and clip it to the exact
+    municipal polygon. Uses numpy for performance.
+    """
+    gdf_proj = gdf.to_crs(crs_projected)
+    xmin, ymin, xmax, ymax = gdf_proj.total_bounds
+
+    xs = np.arange(xmin, xmax, cell_size_m)
+    ys = np.arange(ymin, ymax, cell_size_m)
+
+    cells = [
+        box(x, y, x + cell_size_m, y + cell_size_m)
+        for x in xs for y in ys
+    ]
+
+    grid = gpd.GeoDataFrame(
+        {"grid_id": range(len(cells)), "geometry": cells},
+        crs=crs_projected
+    )
+
+    # Exact clip by municipal polygon (not by bounding box)
+    grid_clipped = gpd.overlay(
+        grid,
+        gdf_proj[["geometry"]],
+        how="intersection",
+        keep_geom_type=True
+    ).reset_index(drop=True)
+
+    grid_clipped["grid_id"]       = grid_clipped.index
+    grid_clipped["grid_area_ha"]  = grid_clipped.geometry.area / 1e4
+    grid_clipped["grid_area_km2"] = grid_clipped.geometry.area / 1e6
+
+    # Border cells: area < 95 % of a full cell
+    full_cell_ha = (cell_size_m ** 2) / 1e4
+    grid_clipped["is_border_cell"] = (
+        grid_clipped["grid_area_ha"] < full_cell_ha * 0.95
+    )
+
+    return grid_clipped
+
+
+grid_1km = create_square_grid(muni_gdf, cell_size_m=1000, crs_projected=plot_crs)
+
+n_border   = int(grid_1km["is_border_cell"].sum())
+n_interior = len(grid_1km) - n_border
+
+print(f"\n1-km analytical grid — {MUNICIPALITY}:")
+print(f"  Total cells    : {len(grid_1km)}")
+print(f"  Interior cells : {n_interior}")
+print(f"  Border cells   : {n_border} ({n_border / len(grid_1km) * 100:.1f} %)")
+
+grid_stats_df = pd.DataFrame([{
+    "municipality":     MUNICIPALITY,
+    "cell_size_m":      1000,
+    "n_cells_total":    len(grid_1km),
+    "n_cells_interior": n_interior,
+    "n_cells_border":   n_border,
+    "pct_border":       round(n_border / len(grid_1km) * 100, 2),
+    "mean_area_ha":     round(float(grid_1km["grid_area_ha"].mean()), 4),
+    "min_area_ha":      round(float(grid_1km["grid_area_ha"].min()),  4),
+    "max_area_ha":      round(float(grid_1km["grid_area_ha"].max()),  4),
+    "total_area_km2":   round(float(grid_1km["grid_area_km2"].sum()), 4),
+}])
+
+grid_gpkg_path    = DIRS["processed"] / "nci_br_sjc_grid_1km.gpkg"
+grid_geojson_path = DIRS["processed"] / "nci_br_sjc_grid_1km.geojson"
+grid_csv_path     = DIRS["tables"]    / "nci_br_sjc_grid_1km_summary.csv"
+grid_stats_path   = DIRS["tables"]    / "nci_br_sjc_grid_1km_cell_stats.csv"
+
+grid_1km.to_file(grid_gpkg_path, layer="grid_1km", driver="GPKG")
+grid_1km.to_crs("EPSG:4326").to_file(grid_geojson_path, driver="GeoJSON")
+pd.DataFrame(grid_1km.drop(columns="geometry")).to_csv(
+    grid_csv_path, index=False, encoding="utf-8-sig"
+)
+grid_stats_df.to_csv(grid_stats_path, index=False, encoding="utf-8-sig")
+
+print(f"\nGrid GPKG    : {grid_gpkg_path}")
+print(f"Grid GeoJSON : {grid_geojson_path}")
+print(f"Grid stats   : {grid_stats_path}")
+
+logger.info(f"Grid: {len(grid_1km)} cells | {n_border} border | {n_interior} interior")
+
+# ------------------------------------------------------------
+# 9. Prepare plotting layers
+# ------------------------------------------------------------
+
+muni_plot = muni_gdf.to_crs(plot_crs)
+grid_plot = grid_1km.to_crs(plot_crs)
+
+xmin, ymin, xmax, ymax = muni_plot.total_bounds
+xbuf = (xmax - xmin) * 0.12
+ybuf = (ymax - ymin) * 0.12
+map_extent = [xmin - xbuf, xmax + xbuf, ymin - ybuf, ymax + ybuf]
+
+# ------------------------------------------------------------
+# 10. Cartographic helper functions
+# ------------------------------------------------------------
+
+def add_north_arrow(ax, x=0.94, y=0.93, size=0.07):
+    ax.annotate(
+        "N", xy=(x, y), xytext=(x, y - size),
+        xycoords="axes fraction",
+        ha="center", va="center",
+        fontsize=11, fontweight="bold",
+        arrowprops=dict(facecolor="black", edgecolor="black",
+                        width=2.5, headwidth=8, headlength=10)
+    )
+
+
+def add_scale_bar(ax, length_km=20, location=(0.07, 0.055), linewidth=3):
+    xlim = ax.get_xlim()
+    ylim = ax.get_ylim()
+    x0   = xlim[0] + (xlim[1] - xlim[0]) * location[0]
+    y0   = ylim[0] + (ylim[1] - ylim[0]) * location[1]
+    lm   = length_km * 1000
+    ax.plot([x0, x0 + lm], [y0, y0],
+            color="black", linewidth=linewidth, solid_capstyle="butt")
+    ax.text(x0 + lm / 2, y0 + (ylim[1] - ylim[0]) * 0.016,
+            f"{length_km} km", ha="center", va="bottom", fontsize=8.5)
+
+
+def add_panel_label(ax, label):
+    ax.text(0.02, 0.97, label, transform=ax.transAxes,
+            fontsize=13, fontweight="bold", va="top", ha="left",
+            bbox=dict(facecolor="white", edgecolor="none",
+                      alpha=0.88, boxstyle="round,pad=0.25"))
+
+
+def add_location_inset(ax, muni_wgs84, bbox_axes=(0.62, 0.01, 0.37, 0.32)):
+    """
+    Add a Brazil-scale location inset to panel ax.
+    Uses cartopy if available; falls back to a simple placeholder.
+    """
+    try:
+        import cartopy.crs as ccrs
+        import cartopy.feature as cfeature
+
+        ax_in = ax.inset_axes(bbox_axes, projection=ccrs.PlateCarree())
+        ax_in.set_extent([-74, -28, -34, 6], crs=ccrs.PlateCarree())
+        ax_in.add_feature(cfeature.LAND,      facecolor="#efefef", zorder=1)
+        ax_in.add_feature(cfeature.BORDERS,   linewidth=0.4,       zorder=2)
+        ax_in.add_feature(cfeature.COASTLINE, linewidth=0.4,       zorder=3)
+        centroid = muni_wgs84.geometry.centroid.iloc[0]
+        ax_in.plot(centroid.x, centroid.y, "r^", markersize=6,
+                   transform=ccrs.PlateCarree(), zorder=5)
+        ax_in.set_axis_off()
+        ax_in.set_title("Location", fontsize=7, pad=2)
+
+    except Exception:
+        ax_in = ax.inset_axes(bbox_axes)
+        ax_in.set_xlim(-74, -28)
+        ax_in.set_ylim(-34, 6)
+        ax_in.set_facecolor("#d8eaf5")
+        ax_in.axhline(0, color="gray", linewidth=0.3, linestyle="--")
+        centroid = muni_wgs84.geometry.centroid.iloc[0]
+        ax_in.plot(centroid.x, centroid.y, "r^", markersize=6)
+        ax_in.set_xticks([])
+        ax_in.set_yticks([])
+        ax_in.set_title("Location", fontsize=7, pad=2)
+        for spine in ["top", "right"]:
+            ax_in.spines[spine].set_visible(False)
+
+# ------------------------------------------------------------
+# 11. High-quality composite figure
+# ------------------------------------------------------------
+
+plt.rcParams.update({
+    "figure.dpi": 150, "savefig.dpi": CONFIG["figure_dpi"],
+    "font.family": "DejaVu Sans", "font.size": 10,
+    "axes.titlesize": 11, "axes.labelsize": 10,
+    "legend.fontsize": 9, "axes.linewidth": 0.8,
+    "pdf.fonttype": 42, "ps.fonttype": 42, "savefig.bbox": "tight",
+})
+
+fig = plt.figure(figsize=(13.5, 7.5), dpi=150)
+gs  = fig.add_gridspec(
+    nrows=2, ncols=3,
+    width_ratios=[1.25, 1.25, 1.05],
+    height_ratios=[1, 1],
+    wspace=0.08, hspace=0.15
+)
+
+ax_a = fig.add_subplot(gs[:, 0])
+ax_b = fig.add_subplot(gs[:, 1])
+ax_c = fig.add_subplot(gs[0, 2])
+ax_d = fig.add_subplot(gs[1, 2])
+
+# ── Panel A — Municipal boundary ─────────────────────────────
+muni_plot.plot(ax=ax_a, color="#c6dbef", edgecolor="black",
+               linewidth=1.2, alpha=0.85)
+
+centroid = muni_plot.geometry.representative_point().iloc[0]
+ax_a.text(centroid.x, centroid.y, MUNICIPALITY,
+          fontsize=9, ha="center", va="center", color="black",
+          path_effects=[pe.withStroke(linewidth=2.8, foreground="white")])
+
+ax_a.set_xlim(map_extent[0], map_extent[1])
+ax_a.set_ylim(map_extent[2], map_extent[3])
+ax_a.set_title(f"Study municipality: {MUNICIPALITY} ({load_source.upper()})",
+               loc="left", pad=8)
+ax_a.set_axis_off()
+
+add_north_arrow(ax_a)
+add_scale_bar(ax_a, length_km=20)
+add_panel_label(ax_a, "a")
+add_location_inset(ax_a, muni_gdf.to_crs("EPSG:4326"))
+
+# ── Panel B — 1-km analytical grid ───────────────────────────
+muni_plot.plot(ax=ax_b, color="#f7f7f7", edgecolor="black", linewidth=1.2)
+
+grid_interior = grid_plot[~grid_plot["is_border_cell"]]
+grid_border   = grid_plot[ grid_plot["is_border_cell"]]
+
+grid_interior.boundary.plot(ax=ax_b, color="#525252", linewidth=0.18)
+grid_border.plot(ax=ax_b, facecolor="#fdae6b", edgecolor="#d94801",
+                 linewidth=0.25, alpha=0.55)
+muni_plot.boundary.plot(ax=ax_b, edgecolor="black", linewidth=1.2)
+
+ax_b.set_xlim(map_extent[0], map_extent[1])
+ax_b.set_ylim(map_extent[2], map_extent[3])
+ax_b.set_title("Analytical grid — 1-km cells (clipped to municipality)",
+               loc="left", pad=8)
+ax_b.set_axis_off()
+
+patch_int = mpatches.Patch(facecolor="white",   edgecolor="#525252",
+                            linewidth=0.8, label="Interior cell")
+patch_brd = mpatches.Patch(facecolor="#fdae6b", edgecolor="#d94801",
+                            linewidth=0.8, label="Border cell")
+ax_b.legend(handles=[patch_int, patch_brd], loc="lower left",
+            fontsize=7.5, framealpha=0.88, edgecolor="#bdbdbd")
+
+add_north_arrow(ax_b)
+add_scale_bar(ax_b, length_km=20)
+add_panel_label(ax_b, "b")
+
+# ── Panel C — Summary statistics table ───────────────────────
+ax_c.axis("off")
+
+table_data = [
+    [MUNICIPALITY,    f"{muni_area_km2:,.1f}", f"{muni_area_ha:,.0f}"],
+    ["Total grid",    str(len(grid_1km)),        "—"],
+    ["  Interior",    str(n_interior),            "—"],
+    ["  Border",      str(n_border),              f"{n_border/len(grid_1km)*100:.1f}%"],
+]
+
+table = ax_c.table(
+    cellText=table_data,
+    colLabels=["Unit", "Value", "Area (ha) / %"],
+    loc="center", cellLoc="center", colLoc="center"
+)
+table.auto_set_font_size(False)
+table.set_fontsize(8.3)
+table.scale(1.0, 1.5)
+
+for (row, col), cell in table.get_celld().items():
+    cell.set_edgecolor("#bdbdbd")
+    cell.set_linewidth(0.5)
+    if row == 0:
+        cell.set_facecolor("#f0f0f0")
+        cell.set_text_props(weight="bold")
+
+ax_c.set_title("Study area summary", loc="left", pad=8)
+add_panel_label(ax_c, "c")
+
+# ── Panel D — Spatial analysis framework ─────────────────────
+ax_d.axis("off")
+
+design_text = (
+    "Spatial analysis design\n\n"
+    f"Study area:\n"
+    f"• {MUNICIPALITY} — SP, Brazil\n"
+    f"• {muni_area_km2:,.1f} km² | {muni_area_ha:,.0f} ha\n\n"
+    "Analytical unit:\n"
+    f"• 1-km × 1-km grid ({len(grid_1km)} cells)\n"
+    f"• Interior: {n_interior} | Border: {n_border}\n\n"
+    "Indicators per cell (next blocks):\n"
+    "• Native vegetation fraction\n"
+    "• Riparian and water proximity\n"
+    "• Flood regulation potential\n"
+    "• NDVI / EVI vegetation condition\n"
+    "• Cumulative anthropogenic pressure\n"
+    "• Spatial hotspots: Moran's I & LISA"
+)
+
+ax_d.text(0.03, 0.96, design_text,
+          transform=ax_d.transAxes, fontsize=8.8, va="top",
+          ha="left", linespacing=1.35,
+          bbox=dict(facecolor="#f7f7f7", edgecolor="#bdbdbd",
+                    boxstyle="round,pad=0.6"))
+ax_d.set_title("NCI-BR multi-scale framework", loc="left", pad=8)
+add_panel_label(ax_d, "d")
+
+fig.suptitle(
+    f"Study area and spatial analysis framework — NCI-BR | {MUNICIPALITY}, SP",
+    fontsize=14, fontweight="bold", y=0.99
+)
+fig.text(0.02, 0.005,
+         f"Source: {load_source.upper()} | Projection: SIRGAS 2000 / Albers Equal Area (EPSG:5880).",
+         fontsize=7.5, color="#4d4d4d")
+
+fig_png = DIRS["figures"] / "figure_01_nci_br_sjc_spatial_framework.png"
+fig_pdf = DIRS["figures"] / "figure_01_nci_br_sjc_spatial_framework.pdf"
+
+plt.savefig(fig_png, dpi=CONFIG["figure_dpi"], bbox_inches="tight")
+plt.savefig(fig_pdf, dpi=CONFIG["figure_dpi"], bbox_inches="tight")
+plt.show()
+
+print(f"\nFigure exported:\n  {fig_png}\n  {fig_pdf}")
+logger.info(f"Figure exported: {fig_png}")
+
+# ------------------------------------------------------------
+# 12. Interactive map
+# ------------------------------------------------------------
+
+muni_ee_map = geemap.geopandas_to_ee(muni_gdf.to_crs("EPSG:4326"))
+grid_ee_map = geemap.geopandas_to_ee(grid_1km.to_crs("EPSG:4326"))
+
+Map = geemap.Map()
+Map.setCenter(-45.88, -23.18, 11)
+
+Map.addLayer(
+    grid_ee_map.style(color="333333", fillColor="00000000", width=0.3),
+    {}, "Analytical grid — 1 km"
+)
+Map.addLayer(
+    muni_ee_map.style(color="000000", fillColor="1a7fbe33", width=2),
+    {}, f"Municipality: {MUNICIPALITY}"
+)
+
+Map
+
+# ------------------------------------------------------------
+# 13. Helper — clip_image_to_aoi (reuse in all subsequent blocks)
+# ------------------------------------------------------------
+
+def clip_image_to_aoi(image: ee.Image, aoi_geometry: ee.Geometry) -> ee.Image:
+    """
+    Clip and mask an ee.Image to the exact municipal boundary.
+    REQUIRED for every raster in all subsequent blocks.
+
+    Usage:
+        img = clip_image_to_aoi(ee.Image("USGS/SRTMGL1_003"), aoi_geom)
+    """
+    return (
+        image
+        .clip(aoi_geometry)
+        .updateMask(
+            ee.Image.constant(1).clip(aoi_geometry).unmask(0)
+        )
+    )
+
+
+# Quick test
+srtm_test = clip_image_to_aoi(ee.Image("USGS/SRTMGL1_003"), aoi_geom)
+test_val  = srtm_test.reduceRegion(
+    reducer=ee.Reducer.mean(),
+    geometry=aoi_geom,
+    scale=30, maxPixels=1e8
+).getInfo()
+print(f"\nclip_image_to_aoi test (mean SRTM elevation in SJC): {test_val}")
+logger.info(f"clip_image_to_aoi OK: {test_val}")
+
+# ------------------------------------------------------------
+# 14. Helper — clip_raster_to_municipality (local GeoTIFFs)
+# ------------------------------------------------------------
+
+def clip_raster_to_municipality(
+    raster_path: Path,
+    muni_gdf: gpd.GeoDataFrame,
+    output_path: Path,
+    nodata: float = -9999
+) -> Path:
+    """
+    Clip a GeoTIFF to the exact municipal polygon using rasterio.
+    Apply to every GeoTIFF downloaded from GEE before local analysis.
+
+    Usage:
+        clip_raster_to_municipality(
+            DIRS["raw"] / "mapbiomas_2024_raw.tif",
+            muni_gdf,
+            DIRS["processed"] / "mapbiomas_2024_sjc.tif"
+        )
+    """
+    with rasterio.open(raster_path) as src:
+        muni_reproj = muni_gdf.to_crs(src.crs)
+        shapes      = [mapping(geom) for geom in muni_reproj.geometry]
+
+        out_image, out_transform = rio_mask(
+            src, shapes, crop=True, filled=True, nodata=nodata
+        )
+        out_meta = src.meta.copy()
+        out_meta.update({
+            "driver": "GTiff", "height": out_image.shape[1],
+            "width":  out_image.shape[2], "transform": out_transform,
+            "nodata": nodata, "compress": "lzw",
+        })
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(output_path, "w", **out_meta) as dest:
+        dest.write(out_image)
+
+    size_mb = output_path.stat().st_size / 1e6
+    print(f"Raster clipped: {output_path.name} ({size_mb:.2f} MB)")
+    logger.info(f"Raster clipped: {output_path}")
+    return output_path
+
+# ------------------------------------------------------------
+# 15. MD5 checksums
+# ------------------------------------------------------------
+
+def md5_checksum(fp: Path) -> str:
+    h = hashlib.md5()
+    with open(fp, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+checksums = {
+    fp.name: md5_checksum(fp)
+    for fp in [gpkg_path, geojson_path, grid_gpkg_path, grid_geojson_path]
+}
+
+checksums_path = DIRS["metadata"] / "nci_br_block02_checksums.json"
+with open(checksums_path, "w", encoding="utf-8") as f:
+    json.dump(checksums, f, indent=4)
+print(f"\nMD5 checksums saved: {checksums_path}")
+
+# ------------------------------------------------------------
+# 16. Block metadata
+# ------------------------------------------------------------
+
+block02_metadata = {
+    "block":            "02",
+    "version":          "final",
+    "municipality":     MUNICIPALITY,
+    "ibge_code":        IBGE_CODE,
+    "state":            STATE_CODE,
+    "boundary_source":  load_source,
+    "output_crs":       plot_crs,
+    "area_km2":         round(muni_area_km2, 4),
+    "area_ha":          round(muni_area_ha,  2),
+    "grid": {
+        "cell_size_m":      1000,
+        "n_cells_total":    len(grid_1km),
+        "n_cells_interior": n_interior,
+        "n_cells_border":   n_border,
+        "pct_border":       round(n_border / len(grid_1km) * 100, 2),
+        "mean_area_ha":     round(float(grid_1km["grid_area_ha"].mean()), 4),
+    },
+    "helpers": ["clip_image_to_aoi", "clip_raster_to_municipality"],
+    "outputs": {
+        "municipality_gpkg":    str(gpkg_path),
+        "municipality_geojson": str(geojson_path),
+        "area_summary_csv":     str(csv_path),
+        "grid_gpkg":            str(grid_gpkg_path),
+        "grid_geojson":         str(grid_geojson_path),
+        "grid_csv":             str(grid_csv_path),
+        "grid_cell_stats":      str(grid_stats_path),
+        "figure_png":           str(fig_png),
+        "figure_pdf":           str(fig_pdf),
+        "checksums":            str(checksums_path),
+    },
+    "created_at": datetime.now().isoformat(),
+}
+
+metadata_path = DIRS["metadata"] / "nci_br_block02_metadata.json"
+with open(metadata_path, "w", encoding="utf-8") as f:
+    json.dump(block02_metadata, f, indent=4, ensure_ascii=False)
+
+print(f"Metadata saved: {metadata_path}")
+logger.info("Block 02 completed — Sao Jose dos Campos.")
+
+# ------------------------------------------------------------
+# 17. Final summary
+# ------------------------------------------------------------
+
+print("\n" + "=" * 62)
+print("BLOCK 02 — COMPLETED")
+print("=" * 62)
+print(f"  Municipality   : {MUNICIPALITY} (code {IBGE_CODE})")
+print(f"  Boundary source: {load_source}")
+print(f"  Area           : {muni_area_km2:,.2f} km² | {muni_area_ha:,.0f} ha")
+print(f"  1-km grid      : {len(grid_1km)} cells")
+print(f"    Interior      : {n_interior}")
+print(f"    Border        : {n_border} ({n_border/len(grid_1km)*100:.1f} %)")
+print(f"  Helpers ready  : clip_image_to_aoi | clip_raster_to_municipality")
+print("=" * 62)
+print("\nNext block: MapBiomas land-cover trajectories 1985–2024")
+print("for Sao Jose dos Campos.")
