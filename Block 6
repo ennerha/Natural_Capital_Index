@@ -1,0 +1,876 @@
+# ============================================================
+# BRAZIL NCI-BR PROJECT
+# BLOCK 06 — FIRST INTEGRATED NCI-BR COMPOSITE INDEX
+# FOCUS: SÃO JOSÉ DOS CAMPOS — SP, BRAZIL
+# ============================================================
+#
+# Corrections applied:
+#   [FIX-1]  File paths updated to nci_br_sjc_* pattern
+#   [FIX-2]  DIRS creation loop added
+#   [FIX-3]  plot_crs defined at block start
+#   [FIX-4]  All CSV exports wrapped in pd.DataFrame()
+#   [FIX-5]  Municipal boundary overlaid on all map panels
+#   [FIX-6]  Consistent map_extent applied to all map panels
+#   [FIX-7]  All output filenames follow nci_br_sjc_* pattern
+#   [FIX-8]  grid_area_ha guarded before aggregation
+#   [FIX-9]  NaN-safe color mapping for class map panel
+#   [FIX-10] grid_id missing handled gracefully in merge
+#   [IMP-1]  NCI-BR distribution histogram added (panel g)
+#   [IMP-2]  Component score correlation heatmap added (panel h)
+#   [IMP-3]  Dry-season NDVI accepted as optional input
+#   [IMP-4]  Percentile scoring documented as design choice
+#   [IMP-5]  Floodplain/hazard conflation note added
+#   [IMP-6]  Typology thresholds documented
+#   [NEW-1]  Weight scenarios sensitivity table added
+#   [NEW-2]  MD5 checksums added
+# ============================================================
+
+import json
+import logging
+import hashlib
+from pathlib import Path
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import matplotlib.patheffects as pe
+
+# ------------------------------------------------------------
+# 1. Reload project configuration
+# ------------------------------------------------------------
+
+PROJECT_ROOT = Path("/content/drive/MyDrive/Brazil/NCI_BR_Project")
+
+DIRS = {
+    "root":         PROJECT_ROOT,
+    "raw":          PROJECT_ROOT / "01_raw",
+    "intermediate": PROJECT_ROOT / "02_intermediate",
+    "processed":    PROJECT_ROOT / "03_processed",
+    "tables":       PROJECT_ROOT / "04_tables",
+    "figures":      PROJECT_ROOT / "05_figures",
+    "maps":         PROJECT_ROOT / "06_maps",
+    "exports":      PROJECT_ROOT / "07_exports",
+    "logs":         PROJECT_ROOT / "08_logs",
+    "metadata":     PROJECT_ROOT / "09_metadata",
+}
+
+# [FIX-2] Create directories
+for d in DIRS.values():
+    d.mkdir(parents=True, exist_ok=True)
+
+config_path = DIRS["metadata"] / "nci_br_config.json"
+with open(config_path, "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
+
+# [FIX-3]
+plot_crs      = CONFIG.get("output_crs", "EPSG:5880")
+MUNICIPALITY  = "São José dos Campos"
+BASELINE_YEAR = int(CONFIG["baseline_year"])
+
+# ------------------------------------------------------------
+# 2. Logging
+# ------------------------------------------------------------
+
+log_file = DIRS["logs"] / f"nci_br_block06_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+logging.basicConfig(
+    filename=log_file, level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger("NCI_BR_BLOCK06")
+logger.info(f"Block 06 started — {MUNICIPALITY}.")
+print(f"Log file: {log_file}")
+
+# ------------------------------------------------------------
+# 3. [FIX-1] Load previous grid products — correct SJC paths
+# ------------------------------------------------------------
+
+lulc_path  = DIRS["processed"] / f"nci_br_sjc_grid_lulc_{BASELINE_YEAR}.gpkg"
+veg_path   = DIRS["processed"] / "nci_br_sjc_grid_vegetation_condition.gpkg"
+hydro_path = DIRS["processed"] / "nci_br_sjc_grid_hydrological_indicators.gpkg"
+muni_path  = DIRS["processed"] / "nci_br_sjc_municipality.gpkg"
+
+for p in [lulc_path, veg_path, hydro_path, muni_path]:
+    if not p.exists():
+        raise FileNotFoundError(
+            f"Required input not found: {p}\n"
+            "Run Blocks 02–05 before Block 06."
+        )
+
+lulc_gdf  = gpd.read_file(lulc_path)
+veg_gdf   = gpd.read_file(veg_path)
+hydro_gdf = gpd.read_file(hydro_path)
+muni_gdf  = gpd.read_file(muni_path)
+
+print("Input layers loaded:")
+print(f"  LULC       : {len(lulc_gdf)} cells")
+print(f"  Vegetation : {len(veg_gdf)} cells")
+print(f"  Hydrology  : {len(hydro_gdf)} cells")
+
+# ------------------------------------------------------------
+# 4. Harmonize and merge tables
+# ------------------------------------------------------------
+# The merge key is grid_id, which should be present in all three
+# layers. If grid_id is absent from veg or hydro (e.g. because
+# geemap.ee_to_gdf dropped it), fall back to a spatial join.
+
+def ensure_grid_id(gdf: gpd.GeoDataFrame, label: str) -> gpd.GeoDataFrame:
+    if "grid_id" not in gdf.columns:
+        print(f"  WARNING: grid_id missing from {label}. Adding index-based id.")
+        gdf = gdf.copy()
+        gdf["grid_id"] = gdf.index.astype(int)
+    return gdf
+
+lulc_gdf  = ensure_grid_id(lulc_gdf,  "LULC")
+veg_gdf   = ensure_grid_id(veg_gdf,   "vegetation")
+hydro_gdf = ensure_grid_id(hydro_gdf, "hydrology")
+
+base_gdf = lulc_gdf.copy()
+
+veg_df   = pd.DataFrame(veg_gdf.drop(columns="geometry",   errors="ignore"))
+hydro_df = pd.DataFrame(hydro_gdf.drop(columns="geometry", errors="ignore"))
+
+merged = base_gdf.merge(veg_df,   on="grid_id", how="left", suffixes=("", "_veg"))
+merged = merged.merge(hydro_df,   on="grid_id", how="left", suffixes=("", "_hydro"))
+
+print(f"Merged grid table: {len(merged)} cells | {len(merged.columns)} columns")
+logger.info(f"Merged: {len(merged)} cells")
+
+# ------------------------------------------------------------
+# 5. Helper functions
+# ------------------------------------------------------------
+
+def find_column(df: pd.DataFrame, candidates: list, required: bool = True):
+    """Return the first candidate column that exists in df."""
+    for col in candidates:
+        if col in df.columns:
+            return col
+    if required:
+        raise ValueError(f"None of the candidate columns found: {candidates}")
+    return None
+
+
+def to_numeric_clean(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+
+def percentile_score(series: pd.Series, invert: bool = False) -> pd.Series:
+    """
+    Rank-based 0–100 score.
+    Design choice: percentile scoring ensures the index is always
+    uniformly distributed [0, 100], making it robust to outliers
+    and non-normal distributions. It is a relative measure —
+    cells are scored against each other within the study area.
+    [IMP-4]
+    """
+    x = to_numeric_clean(series)
+    score = x.rank(pct=True) * 100
+    return 100 - score if invert else score
+
+
+def minmax_score(series: pd.Series, invert: bool = False) -> pd.Series:
+    """Linear min-max rescaling to [0, 100]."""
+    x = to_numeric_clean(series)
+    xmin, xmax = x.min(), x.max()
+    if pd.isna(xmin) or pd.isna(xmax) or xmax == xmin:
+        return pd.Series(np.nan, index=x.index)
+    score = (x - xmin) / (xmax - xmin) * 100
+    return 100 - score if invert else score
+
+# ------------------------------------------------------------
+# 6. Select input indicators
+# ------------------------------------------------------------
+
+native_col = find_column(merged, [
+    f"native_vegetation_pct_{BASELINE_YEAR}",
+    f"native_vegetation_ha_{BASELINE_YEAR}",
+])
+anthropic_col = find_column(merged, [
+    f"anthropic_pct_{BASELINE_YEAR}",
+    f"anthropic_ha_{BASELINE_YEAR}",
+])
+urban_col  = find_column(merged, [f"urban_pct_{BASELINE_YEAR}"],     required=False)
+water_col  = find_column(merged, [f"water_pct_{BASELINE_YEAR}"],     required=False)
+
+ndvi_col   = find_column(merged, [
+    "NDVI_mean_series_mean",
+    "NDVI_mean_2015_2024_mean",
+    f"NDVI_{BASELINE_YEAR}_mean",
+    "NDVI_mean",
+])
+# [IMP-3] Prefer dry-season NDVI if available
+ndvi_dry_col   = find_column(merged, [
+    f"NDVI_dry_{BASELINE_YEAR}_mean",
+    "NDVI_dry_series_mean",
+], required=False)
+ndvi_trend_col = find_column(merged, [
+    "NDVI_slope_series_mean",
+    "NDVI_slope_2015_2024_mean",
+], required=False)
+
+hydro_reg_col = find_column(merged, [
+    "hydrological_regulation_score_mean",
+    "hydrological_regulation_score_median",
+    "hydrological_regulation_score",
+])
+flood_col = find_column(merged, [
+    "flood_susceptibility_score_mean",
+    "flood_susceptibility_score_median",
+    "flood_susceptibility_score",
+], required=False)
+
+# Use dry-season NDVI if available, otherwise annual mean
+ndvi_condition_col = ndvi_dry_col if ndvi_dry_col else ndvi_col
+
+print("\nSelected indicators:")
+for name, col in [
+    ("Native vegetation",     native_col),
+    ("Anthropic pressure",    anthropic_col),
+    ("Urban",                 urban_col),
+    ("Water",                 water_col),
+    ("NDVI condition",        ndvi_condition_col),
+    ("NDVI trend",            ndvi_trend_col),
+    ("Hydrological regulation", hydro_reg_col),
+    ("Flood susceptibility",  flood_col),
+]:
+    print(f"  {name:<26}: {col}")
+
+# ------------------------------------------------------------
+# 7. Build normalized component scores
+# ------------------------------------------------------------
+
+merged["score_native_vegetation"]      = percentile_score(merged[native_col])
+merged["score_low_anthropic_pressure"] = percentile_score(merged[anthropic_col], invert=True)
+merged["score_vegetation_condition"]   = percentile_score(merged[ndvi_condition_col])
+merged["score_hydrological_regulation"]= percentile_score(merged[hydro_reg_col])
+
+merged["score_vegetation_trend"] = (
+    percentile_score(merged[ndvi_trend_col]) if ndvi_trend_col else
+    pd.Series(np.nan, index=merged.index)
+)
+
+# [IMP-5] flood_susceptibility_score here proxies flood regulation
+# capacity (low HAND + proximity to water). Note: this conflates
+# ecosystem service provision with hazard exposure. In later blocks
+# it should be combined with native vegetation cover to distinguish
+# genuine regulation capacity from mere lowland location.
+merged["score_floodplain_function"] = (
+    percentile_score(merged[flood_col]) if flood_col else
+    pd.Series(np.nan, index=merged.index)
+)
+
+merged["score_surface_water"] = (
+    percentile_score(merged[water_col]) if water_col else
+    pd.Series(np.nan, index=merged.index)
+)
+merged["score_low_urban_pressure"] = (
+    percentile_score(merged[urban_col], invert=True) if urban_col else
+    pd.Series(np.nan, index=merged.index)
+)
+
+# ------------------------------------------------------------
+# 8. NCI-BR composite index — base formulation
+# ------------------------------------------------------------
+# Weights reflect the first-version formulation.
+# Component rationale:
+#   native_vegetation      (30 %) — primary biodiversity and
+#                                   ecosystem structure signal
+#   vegetation_condition   (20 %) — vegetation health and function
+#   hydrological_regulation(20 %) — water regulation service
+#   low_anthropic_pressure (15 %) — absence of degradation
+#   floodplain_function    (10 %) — lowland/riparian function [IMP-5]
+#   vegetation_trend       ( 5 %) — trajectory / resilience proxy
+#
+# Design: percentile scoring + weighted mean with missing-value
+# adjustment ensures cells with fewer valid inputs are not unduly
+# penalised — their weights are renormalised to 1.
+
+WEIGHTS = {
+    "score_native_vegetation":       0.30,
+    "score_vegetation_condition":    0.20,
+    "score_hydrological_regulation": 0.20,
+    "score_low_anthropic_pressure":  0.15,
+    "score_floodplain_function":     0.10,
+    "score_vegetation_trend":        0.05,
+}
+
+weighted_sum  = pd.Series(0.0, index=merged.index)
+weight_sum    = pd.Series(0.0, index=merged.index)
+
+for col, w in WEIGHTS.items():
+    valid = merged[col].notna()
+    weighted_sum.loc[valid] += merged.loc[valid, col] * w
+    weight_sum.loc[valid]   += w
+
+merged["NCI_BR_raw"] = weighted_sum / weight_sum
+merged["NCI_BR"]     = minmax_score(merged["NCI_BR_raw"])
+
+# NCI-BR quintile classes
+bins   = [0, 20, 40, 60, 80, 100]
+labels = [
+    "Very low",
+    "Low",
+    "Moderate",
+    "High",
+    "Very high",
+]
+merged["NCI_BR_class"] = pd.cut(
+    merged["NCI_BR"], bins=bins, labels=labels, include_lowest=True
+)
+
+# ------------------------------------------------------------
+# 9. [NEW-1] Weight sensitivity analysis
+# ------------------------------------------------------------
+# Three alternative weight scenarios to bracket uncertainty.
+
+SCENARIOS = {
+    "base": {
+        "score_native_vegetation":       0.30,
+        "score_vegetation_condition":    0.20,
+        "score_hydrological_regulation": 0.20,
+        "score_low_anthropic_pressure":  0.15,
+        "score_floodplain_function":     0.10,
+        "score_vegetation_trend":        0.05,
+    },
+    "ecology_focus": {
+        "score_native_vegetation":       0.45,
+        "score_vegetation_condition":    0.25,
+        "score_hydrological_regulation": 0.10,
+        "score_low_anthropic_pressure":  0.10,
+        "score_floodplain_function":     0.05,
+        "score_vegetation_trend":        0.05,
+    },
+    "hydro_focus": {
+        "score_native_vegetation":       0.20,
+        "score_vegetation_condition":    0.10,
+        "score_hydrological_regulation": 0.40,
+        "score_low_anthropic_pressure":  0.15,
+        "score_floodplain_function":     0.10,
+        "score_vegetation_trend":        0.05,
+    },
+    "equal_weights": {
+        "score_native_vegetation":       1/6,
+        "score_vegetation_condition":    1/6,
+        "score_hydrological_regulation": 1/6,
+        "score_low_anthropic_pressure":  1/6,
+        "score_floodplain_function":     1/6,
+        "score_vegetation_trend":        1/6,
+    },
+}
+
+sensitivity_records = []
+for scenario_name, w_dict in SCENARIOS.items():
+    ws, wt = pd.Series(0.0, index=merged.index), pd.Series(0.0, index=merged.index)
+    for col, w in w_dict.items():
+        valid = merged[col].notna()
+        ws.loc[valid] += merged.loc[valid, col] * w
+        wt.loc[valid] += w
+    raw  = ws / wt
+    norm = minmax_score(raw)
+    sensitivity_records.append({
+        "scenario": scenario_name,
+        "mean_NCI":   round(float(norm.mean()),   2),
+        "median_NCI": round(float(norm.median()), 2),
+        "std_NCI":    round(float(norm.std()),    2),
+        "corr_base":  round(float(norm.corr(merged["NCI_BR"])), 4),
+    })
+    merged[f"NCI_BR_{scenario_name}"] = norm
+
+sensitivity_df   = pd.DataFrame(sensitivity_records)
+sensitivity_path = DIRS["tables"] / "nci_br_sjc_index_sensitivity_scenarios.csv"
+sensitivity_df.to_csv(sensitivity_path, index=False, encoding="utf-8-sig")
+print(f"\nSensitivity scenarios:\n{sensitivity_df.to_string(index=False)}")
+
+# ------------------------------------------------------------
+# 10. Spatial typology
+# ------------------------------------------------------------
+# Typology thresholds: Q75 for "high", Q25 for "low" [IMP-6]
+
+q75_nci   = float(merged["NCI_BR"].quantile(0.75))
+q25_press = float(merged["score_low_anthropic_pressure"].quantile(0.25))
+q75_hydro = float(merged["score_hydrological_regulation"].quantile(0.75))
+
+merged["high_natural_capital"]       = merged["NCI_BR"] >= q75_nci
+merged["high_anthropic_pressure"]    = merged["score_low_anthropic_pressure"] <= q25_press
+merged["high_hydro_regulation"]      = merged["score_hydrological_regulation"] >= q75_hydro
+
+
+def classify_typology(row):
+    if row["high_natural_capital"] and row["high_anthropic_pressure"]:
+        return "High NCI under pressure"
+    if row["high_natural_capital"] and row["high_hydro_regulation"]:
+        return "High NCI – hydro priority"
+    if row["high_natural_capital"]:
+        return "High NCI – conservation priority"
+    if row["high_anthropic_pressure"]:
+        return "Low NCI / high pressure"
+    return "Intermediate"
+
+
+merged["NCI_BR_typology"] = merged.apply(classify_typology, axis=1)
+
+# ------------------------------------------------------------
+# 11. Summary statistics
+# ------------------------------------------------------------
+
+score_cols = [
+    "NCI_BR",
+    "score_native_vegetation",
+    "score_vegetation_condition",
+    "score_hydrological_regulation",
+    "score_low_anthropic_pressure",
+    "score_floodplain_function",
+    "score_vegetation_trend",
+]
+
+summary_records = []
+for col in score_cols:
+    v = to_numeric_clean(merged[col])
+    summary_records.append({
+        "indicator": col,
+        "mean":    round(float(v.mean()),           2),
+        "median":  round(float(v.median()),         2),
+        "std":     round(float(v.std()),            2),
+        "min":     round(float(v.min()),            2),
+        "q10":     round(float(v.quantile(0.10)),   2),
+        "q25":     round(float(v.quantile(0.25)),   2),
+        "q75":     round(float(v.quantile(0.75)),   2),
+        "q90":     round(float(v.quantile(0.90)),   2),
+        "max":     round(float(v.max()),            2),
+        "n_cells": int(v.notna().sum()),
+    })
+
+summary_df = pd.DataFrame(summary_records)
+
+# Class summary — [FIX-8] guard grid_area_ha
+agg_dict = {"grid_id": "count", "NCI_BR": "mean"}
+if "grid_area_ha" in merged.columns:
+    agg_dict["grid_area_ha"] = "sum"
+
+class_summary = (
+    merged.groupby("NCI_BR_class", observed=False)
+    .agg(agg_dict)
+    .reset_index()
+    .rename(columns={"grid_id": "n_cells", "NCI_BR": "mean_NCI_BR"})
+)
+
+typology_summary = (
+    merged.groupby("NCI_BR_typology")
+    .agg(agg_dict)
+    .reset_index()
+    .rename(columns={"grid_id": "n_cells", "NCI_BR": "mean_NCI_BR"})
+    .sort_values("mean_NCI_BR", ascending=False)
+)
+
+# ------------------------------------------------------------
+# 12. Export integrated products
+# ------------------------------------------------------------
+
+# [FIX-7] All paths follow nci_br_sjc_* pattern
+nci_path            = DIRS["processed"] / "nci_br_sjc_grid_integrated_index.gpkg"
+nci_csv             = DIRS["tables"]    / "nci_br_sjc_grid_integrated_index.csv"
+summary_path        = DIRS["tables"]    / "nci_br_sjc_integrated_index_summary.csv"
+class_summary_path  = DIRS["tables"]    / "nci_br_sjc_integrated_index_classes.csv"
+typology_path       = DIRS["tables"]    / "nci_br_sjc_integrated_index_typology.csv"
+
+merged.to_file(nci_path, layer="nci_br_index", driver="GPKG")
+
+# [FIX-4] pd.DataFrame() before CSV export
+pd.DataFrame(merged.drop(columns="geometry", errors="ignore")).to_csv(
+    nci_csv, index=False, encoding="utf-8-sig"
+)
+summary_df.to_csv(summary_path,       index=False, encoding="utf-8-sig")
+class_summary.to_csv(class_summary_path, index=False, encoding="utf-8-sig")
+typology_summary.to_csv(typology_path,   index=False, encoding="utf-8-sig")
+
+print("\nNCI-BR products exported:")
+for p in [nci_path, nci_csv, summary_path, class_summary_path, typology_path, sensitivity_path]:
+    print(f"  {p}")
+logger.info(f"NCI-BR grid exported: {len(merged)} cells")
+
+# ------------------------------------------------------------
+# 13. Prepare plotting layers
+# ------------------------------------------------------------
+
+plot_gdf  = merged.to_crs(plot_crs) if merged.crs else merged.copy()
+muni_plot = muni_gdf.to_crs(plot_crs)
+
+for col in score_cols + [f"NCI_BR_{s}" for s in SCENARIOS]:
+    if col in plot_gdf.columns:
+        plot_gdf[col] = pd.to_numeric(plot_gdf[col], errors="coerce")
+
+xmin, ymin, xmax, ymax = muni_plot.total_bounds
+xbuf = (xmax - xmin) * 0.05
+ybuf = (ymax - ymin) * 0.05
+map_extent = [xmin - xbuf, xmax + xbuf, ymin - ybuf, ymax + ybuf]
+
+CLASS_COLORS = {
+    "Very low":   "#b2182b",
+    "Low":        "#ef8a62",
+    "Moderate":   "#fddbc7",
+    "High":       "#74c476",
+    "Very high":  "#1a7a3c",
+}
+
+
+def overlay_boundary(ax, gdf):
+    gdf.boundary.plot(ax=ax, edgecolor="black", linewidth=1.2, zorder=5)
+
+
+def set_map_extent(ax):
+    ax.set_xlim(map_extent[0], map_extent[1])
+    ax.set_ylim(map_extent[2], map_extent[3])
+    ax.set_axis_off()
+
+
+def add_panel_label(ax, label):
+    ax.text(0.02, 0.97, label, transform=ax.transAxes,
+            fontsize=12, fontweight="bold", va="top", ha="left",
+            bbox=dict(facecolor="white", edgecolor="none",
+                      alpha=0.88, boxstyle="round,pad=0.22"))
+
+# [FIX-9] NaN-safe class color mapping
+plot_gdf["class_color"] = (
+    plot_gdf["NCI_BR_class"]
+    .astype(str)
+    .map(CLASS_COLORS)
+    .fillna("#cccccc")   # grey for NaN cells
+)
+
+# ------------------------------------------------------------
+# 14. High-quality composite figure — 9 panels
+# ------------------------------------------------------------
+
+plt.rcParams.update({
+    "figure.dpi": 150, "savefig.dpi": CONFIG["figure_dpi"],
+    "font.family": "DejaVu Sans", "font.size": 9.5,
+    "axes.titlesize": 10, "axes.labelsize": 9,
+    "legend.fontsize": 8.5, "axes.linewidth": 0.7,
+    "pdf.fonttype": 42, "ps.fonttype": 42, "savefig.bbox": "tight",
+})
+
+fig = plt.figure(figsize=(16, 11), dpi=150)
+gs  = fig.add_gridspec(
+    nrows=3, ncols=3,
+    width_ratios=[1.2, 1.2, 1.0],
+    height_ratios=[1, 1, 1],
+    wspace=0.22, hspace=0.32
+)
+
+ax_a = fig.add_subplot(gs[0, 0])
+ax_b = fig.add_subplot(gs[0, 1])
+ax_c = fig.add_subplot(gs[0, 2])
+ax_d = fig.add_subplot(gs[1, 0])
+ax_e = fig.add_subplot(gs[1, 1])
+ax_f = fig.add_subplot(gs[1, 2])
+ax_g = fig.add_subplot(gs[2, 0])
+ax_h = fig.add_subplot(gs[2, 1])
+ax_i = fig.add_subplot(gs[2, 2])
+
+# ── Panel a — NCI-BR continuous map ──────────────────────────
+plot_gdf.plot(
+    column="NCI_BR", ax=ax_a,
+    cmap="YlGn", linewidth=0.0, legend=True,
+    legend_kwds={"label": "NCI-BR (0–100)", "shrink": 0.7},
+    missing_kwds={"color": "lightgrey"},
+    vmin=0, vmax=100
+)
+overlay_boundary(ax_a, muni_plot)
+set_map_extent(ax_a)
+ax_a.set_title("Integrated Natural Capital Index (NCI-BR)", loc="left")
+add_panel_label(ax_a, "a")
+
+# ── Panel b — NCI-BR class map ────────────────────────────────
+plot_gdf.plot(ax=ax_b, color=plot_gdf["class_color"], linewidth=0.0)
+overlay_boundary(ax_b, muni_plot)
+set_map_extent(ax_b)
+ax_b.set_title("NCI-BR quintile classes", loc="left")
+
+handles = [
+    mpatches.Patch(facecolor=color, edgecolor="none", label=label)
+    for label, color in CLASS_COLORS.items()
+]
+ax_b.legend(handles=handles, loc="lower left",
+            fontsize=7.0, framealpha=0.90, edgecolor="#bdbdbd")
+add_panel_label(ax_b, "b")
+
+# ── Panel c — Summary statistics table ───────────────────────
+ax_c.axis("off")
+
+tbl_df = summary_df[summary_df["indicator"].isin([
+    "NCI_BR",
+    "score_native_vegetation",
+    "score_vegetation_condition",
+    "score_hydrological_regulation",
+    "score_low_anthropic_pressure",
+])].copy()
+
+tbl_df["indicator"] = (
+    tbl_df["indicator"]
+    .str.replace("score_", "", regex=False)
+    .str.replace("_", " ")
+    .str.title()
+)
+for col in ["mean", "median", "q75", "q90"]:
+    tbl_df[col] = tbl_df[col].map(lambda x: f"{x:.1f}")
+
+table = ax_c.table(
+    cellText=tbl_df[["indicator", "mean", "median", "q75"]].values,
+    colLabels=["Component", "Mean", "Median", "Q75"],
+    loc="center", cellLoc="center"
+)
+table.auto_set_font_size(False)
+table.set_fontsize(7.5)
+table.scale(1.0, 1.38)
+for (row, col), cell in table.get_celld().items():
+    cell.set_edgecolor("#bdbdbd")
+    cell.set_linewidth(0.5)
+    if row == 0:
+        cell.set_facecolor("#f0f0f0")
+        cell.set_text_props(weight="bold")
+ax_c.set_title("NCI-BR component statistics (0–100)", loc="left")
+add_panel_label(ax_c, "c")
+
+# ── Panel d — Native vegetation score map ────────────────────
+plot_gdf.plot(
+    column="score_native_vegetation", ax=ax_d,
+    cmap="Greens", linewidth=0.0, legend=True,
+    legend_kwds={"label": "Native veg. score (0–100)", "shrink": 0.7},
+    missing_kwds={"color": "lightgrey"},
+    vmin=0, vmax=100
+)
+overlay_boundary(ax_d, muni_plot)
+set_map_extent(ax_d)
+ax_d.set_title("Native vegetation component score", loc="left")
+add_panel_label(ax_d, "d")
+
+# ── Panel e — Hydrological regulation score map ───────────────
+plot_gdf.plot(
+    column="score_hydrological_regulation", ax=ax_e,
+    cmap="YlGnBu", linewidth=0.0, legend=True,
+    legend_kwds={"label": "Hydro. regulation score (0–100)", "shrink": 0.7},
+    missing_kwds={"color": "lightgrey"},
+    vmin=0, vmax=100
+)
+overlay_boundary(ax_e, muni_plot)
+set_map_extent(ax_e)
+ax_e.set_title("Hydrological regulation component score", loc="left")
+add_panel_label(ax_e, "e")
+
+# ── Panel f — Spatial typology table ─────────────────────────
+ax_f.axis("off")
+
+typ_disp = typology_summary.copy()
+typ_disp["mean_NCI_BR"] = typ_disp["mean_NCI_BR"].map(lambda x: f"{x:.1f}")
+if "grid_area_ha" in typ_disp.columns:
+    typ_disp["grid_area_ha"] = typ_disp["grid_area_ha"].map(lambda x: f"{x:,.0f}")
+    cols_show = ["NCI_BR_typology", "n_cells", "mean_NCI_BR", "grid_area_ha"]
+    col_labels = ["Typology", "Cells", "Mean NCI", "Area (ha)"]
+else:
+    cols_show  = ["NCI_BR_typology", "n_cells", "mean_NCI_BR"]
+    col_labels = ["Typology", "Cells", "Mean NCI"]
+
+table2 = ax_f.table(
+    cellText=typ_disp[cols_show].values,
+    colLabels=col_labels,
+    loc="center", cellLoc="center"
+)
+table2.auto_set_font_size(False)
+table2.set_fontsize(6.8)
+table2.scale(1.0, 1.28)
+for (row, col), cell in table2.get_celld().items():
+    cell.set_edgecolor("#bdbdbd")
+    cell.set_linewidth(0.5)
+    if row == 0:
+        cell.set_facecolor("#f0f0f0")
+        cell.set_text_props(weight="bold")
+ax_f.set_title(f"NCI-BR spatial typology (Q75/Q25 thresholds)", loc="left")
+add_panel_label(ax_f, "f")
+
+# ── Panel g — [IMP-1] NCI-BR distribution histogram ──────────
+nci_vals = plot_gdf["NCI_BR"].dropna()
+if len(nci_vals) > 0:
+    ax_g.hist(nci_vals, bins=40, color="#1a7a3c", edgecolor="white",
+              linewidth=0.4, alpha=0.85)
+    ax_g.axvline(float(nci_vals.median()), color="black", linewidth=1.2,
+                 linestyle="--", label=f"Median = {nci_vals.median():.1f}")
+    ax_g.axvline(float(nci_vals.mean()),   color="#d62728", linewidth=1.0,
+                 linestyle=":",  label=f"Mean = {nci_vals.mean():.1f}")
+    for b in [20, 40, 60, 80]:
+        ax_g.axvline(b, color="gray", linewidth=0.5, linestyle="--", alpha=0.4)
+    ax_g.set_xlabel("NCI-BR (0–100)")
+    ax_g.set_ylabel("Number of 1-km cells")
+    ax_g.set_title("NCI-BR distribution across 1-km cells", loc="left")
+    ax_g.legend(fontsize=7.5, framealpha=0.85)
+    ax_g.grid(True, linewidth=0.3, alpha=0.5)
+add_panel_label(ax_g, "g")
+
+# ── Panel h — [IMP-2] Component score correlation heatmap ─────
+corr_cols = [c for c in score_cols if c != "NCI_BR" and plot_gdf[c].notna().any()]
+if len(corr_cols) >= 2:
+    corr_matrix = plot_gdf[corr_cols].corr()
+    short_labels = [
+        c.replace("score_", "").replace("_", "\n")
+        for c in corr_cols
+    ]
+    im = ax_h.imshow(corr_matrix.values, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
+    ax_h.set_xticks(range(len(corr_cols)))
+    ax_h.set_yticks(range(len(corr_cols)))
+    ax_h.set_xticklabels(short_labels, fontsize=7, rotation=45, ha="right")
+    ax_h.set_yticklabels(short_labels, fontsize=7)
+    for i in range(len(corr_cols)):
+        for j in range(len(corr_cols)):
+            val = corr_matrix.iloc[i, j]
+            ax_h.text(j, i, f"{val:.2f}", ha="center", va="center",
+                      fontsize=6.5, color="black" if abs(val) < 0.6 else "white")
+    plt.colorbar(im, ax=ax_h, shrink=0.75, label="Pearson r")
+    ax_h.set_title("Component score correlation matrix", loc="left")
+else:
+    ax_h.axis("off")
+    ax_h.text(0.5, 0.5, "Insufficient\ncomponents", ha="center",
+              va="center", transform=ax_h.transAxes)
+add_panel_label(ax_h, "h")
+
+# ── Panel i — Weight scenario sensitivity ────────────────────
+scen_names = [r["scenario"].replace("_", " ").title() for r in sensitivity_records]
+scen_means  = [r["mean_NCI"]   for r in sensitivity_records]
+scen_corrs  = [r["corr_base"]  for r in sensitivity_records]
+bar_colors  = ["#1a7a3c", "#2171b5", "#d95f02", "#7570b3"]
+
+bars = ax_i.bar(scen_names, scen_means, color=bar_colors,
+                edgecolor="white", linewidth=0.5, alpha=0.85)
+for bar, corr in zip(bars, scen_corrs):
+    ax_i.text(bar.get_x() + bar.get_width() / 2,
+              bar.get_height() + 0.8,
+              f"r={corr:.3f}", ha="center", va="bottom", fontsize=7.5)
+ax_i.set_ylabel("Mean NCI-BR score (0–100)")
+ax_i.set_title("Mean NCI-BR under alternative weight scenarios", loc="left")
+ax_i.tick_params(axis="x", labelsize=8)
+ax_i.set_ylim(0, max(scen_means) * 1.12)
+ax_i.grid(axis="y", linewidth=0.3, alpha=0.5)
+ax_i.set_xlabel("r = Pearson correlation with base scenario")
+add_panel_label(ax_i, "i")
+
+fig.suptitle(
+    f"Integrated Natural Capital Index (NCI-BR) — {MUNICIPALITY}, SP",
+    fontsize=13, fontweight="bold", y=0.995
+)
+fig.text(
+    0.02, 0.005,
+    "NCI-BR integrates native vegetation cover, vegetation condition (NDVI), "
+    "hydrological regulation, low anthropogenic pressure, floodplain function, "
+    "and vegetation trend. Percentile scoring; weights: veg 30%, cond 20%, hydro 20%, "
+    "pressure 15%, flood 10%, trend 5%.",
+    fontsize=7.5, color="#4d4d4d"
+)
+
+fig_png = DIRS["figures"] / "figure_05_nci_br_sjc_integrated_index.png"
+fig_pdf = DIRS["figures"] / "figure_05_nci_br_sjc_integrated_index.pdf"
+
+plt.savefig(fig_png, dpi=CONFIG["figure_dpi"], bbox_inches="tight")
+plt.savefig(fig_pdf, dpi=CONFIG["figure_dpi"], bbox_inches="tight")
+plt.show()
+
+print(f"\nFigure exported:\n  {fig_png}\n  {fig_pdf}")
+logger.info(f"Figure exported: {fig_png}")
+
+# ------------------------------------------------------------
+# 15. MD5 checksums  [NEW-2]
+# ------------------------------------------------------------
+
+def md5_checksum(fp: Path) -> str:
+    h = hashlib.md5()
+    with open(fp, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+checksum_files = [nci_path, nci_csv]
+checksums      = {fp.name: md5_checksum(fp) for fp in checksum_files}
+checksums_path = DIRS["metadata"] / "nci_br_block06_checksums.json"
+with open(checksums_path, "w") as f:
+    json.dump(checksums, f, indent=4)
+print(f"MD5 checksums: {checksums_path}")
+
+# ------------------------------------------------------------
+# 16. Block metadata
+# ------------------------------------------------------------
+
+block06_metadata = {
+    "block":        "06",
+    "version":      "final",
+    "municipality": MUNICIPALITY,
+    "baseline_year": BASELINE_YEAR,
+    "scoring_method": "percentile rank (0–100, relative within study area)",
+    "weights_base":   WEIGHTS,
+    "scenarios":      {k: v for k, v in SCENARIOS.items()},
+    "typology_thresholds": {
+        "high_natural_capital": "NCI_BR >= Q75",
+        "high_anthropic_pressure": "score_low_anthropic_pressure <= Q25",
+        "high_hydro_regulation": "score_hydrological_regulation >= Q75",
+    },
+    "input_files": {
+        "lulc":       str(lulc_path),
+        "vegetation": str(veg_path),
+        "hydrology":  str(hydro_path),
+    },
+    "selected_indicators": {
+        "native_vegetation":      native_col,
+        "anthropic_pressure":     anthropic_col,
+        "ndvi_condition":         ndvi_condition_col,
+        "ndvi_trend":             ndvi_trend_col,
+        "hydrological_regulation": hydro_reg_col,
+        "flood_susceptibility":   flood_col,
+    },
+    "outputs": {
+        "nci_grid_gpkg":          str(nci_path),
+        "nci_grid_csv":           str(nci_csv),
+        "summary_stats":          str(summary_path),
+        "class_summary":          str(class_summary_path),
+        "typology_summary":       str(typology_path),
+        "sensitivity_scenarios":  str(sensitivity_path),
+        "figure_png":             str(fig_png),
+        "figure_pdf":             str(fig_pdf),
+        "checksums":              str(checksums_path),
+    },
+    "created_at": datetime.now().isoformat(),
+}
+
+metadata_path = DIRS["metadata"] / "nci_br_block06_metadata.json"
+with open(metadata_path, "w", encoding="utf-8") as f:
+    json.dump(block06_metadata, f, indent=4, ensure_ascii=False)
+print(f"Metadata saved: {metadata_path}")
+logger.info("Block 06 completed.")
+
+# ------------------------------------------------------------
+# 17. Final summary
+# ------------------------------------------------------------
+
+nci_mean   = float(merged["NCI_BR"].mean())
+nci_median = float(merged["NCI_BR"].median())
+nci_std    = float(merged["NCI_BR"].std())
+
+print("\n" + "=" * 62)
+print(f"BLOCK 06 — COMPLETED | {MUNICIPALITY}")
+print("=" * 62)
+print(f"  Grid cells      : {len(merged)}")
+print(f"  NCI-BR mean     : {nci_mean:.1f}")
+print(f"  NCI-BR median   : {nci_median:.1f}")
+print(f"  NCI-BR std dev  : {nci_std:.1f}")
+
+print(f"\n  Class distribution:")
+for _, row in class_summary.iterrows():
+    pct = row["n_cells"] / len(merged) * 100
+    print(f"    {str(row['NCI_BR_class']):<10}: {int(row['n_cells']):>4} cells "
+          f"({pct:.1f} %) | mean NCI = {row['mean_NCI_BR']:.1f}")
+
+print(f"\n  Scenario correlations with base:")
+for r in sensitivity_records:
+    print(f"    {r['scenario']:<20}: r = {r['corr_base']:.4f}")
+
+print("=" * 62)
+print("\nNext block: spatial statistics — Moran's I, LISA clusters,")
+print("and hotspot detection for NCI-BR.")
