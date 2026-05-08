@@ -1,0 +1,836 @@
+# ============================================================
+# BRAZIL NCI-BR PROJECT
+# BLOCK 04 — VEGETATION CONDITION: LANDSAT NDVI/EVI
+# FOCUS: SÃO JOSÉ DOS CAMPOS — SP, BRAZIL
+# ============================================================
+#
+# Corrections applied:
+#   [FIX-1]  File paths updated to nci_br_sjc_* pattern
+#   [FIX-2]  clip_image_to_aoi() applied to all composites
+#   [FIX-3]  Grid CSV exported via pd.DataFrame()
+#   [FIX-4]  DIRS creation loop added
+#   [FIX-5]  plot_crs defined at block start
+#   [FIX-6]  Municipal boundary overlaid on all map panels
+#   [FIX-7]  Consistent map_extent applied to panels D–F
+#   [FIX-8]  All output filenames follow nci_br_sjc_* pattern
+#   [FIX-9]  Guard: BASELINE_YEAR clamped to analysis range
+#   [FIX-10] tileScale=4 added to reduceRegions()
+#   [IMP-1]  EVI clamped to [-1, 1] to remove outliers
+#   [IMP-2]  Dry-season (Apr–Sep) composite added
+#   [IMP-3]  CV of annual NDVI added as trend-stability proxy
+#   [IMP-4]  Colorbar labels with units on all map panels
+#   [NEW-1]  Valid observation count per cell per year
+#   [NEW-2]  Export.table.toDrive fallback documented
+# ============================================================
+
+import json
+import logging
+import hashlib
+from pathlib import Path
+from datetime import datetime
+
+import ee
+import geemap
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import matplotlib.patheffects as pe
+from matplotlib.colors import TwoSlopeNorm
+
+# ------------------------------------------------------------
+# 1. Reload project configuration
+# ------------------------------------------------------------
+
+PROJECT_ROOT = Path("/content/drive/MyDrive/Brazil/NCI_BR_Project")
+
+DIRS = {
+    "root":         PROJECT_ROOT,
+    "raw":          PROJECT_ROOT / "01_raw",
+    "intermediate": PROJECT_ROOT / "02_intermediate",
+    "processed":    PROJECT_ROOT / "03_processed",
+    "tables":       PROJECT_ROOT / "04_tables",
+    "figures":      PROJECT_ROOT / "05_figures",
+    "maps":         PROJECT_ROOT / "06_maps",
+    "exports":      PROJECT_ROOT / "07_exports",
+    "logs":         PROJECT_ROOT / "08_logs",
+    "metadata":     PROJECT_ROOT / "09_metadata",
+}
+
+# [FIX-4] Create directories
+for d in DIRS.values():
+    d.mkdir(parents=True, exist_ok=True)
+
+config_path = DIRS["metadata"] / "nci_br_config.json"
+with open(config_path, "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
+
+# [FIX-5] Define plot_crs at block start
+plot_crs      = CONFIG.get("output_crs", "EPSG:5880")
+MUNICIPALITY  = "São José dos Campos"
+
+# ------------------------------------------------------------
+# 2. Logging
+# ------------------------------------------------------------
+
+log_file = DIRS["logs"] / f"nci_br_block04_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+logging.basicConfig(
+    filename=log_file, level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger("NCI_BR_BLOCK04")
+logger.info(f"Block 04 started — {MUNICIPALITY}.")
+print(f"Log file: {log_file}")
+
+# ------------------------------------------------------------
+# 3. Earth Engine initialization
+# ------------------------------------------------------------
+
+try:
+    ee.Initialize(project=CONFIG["gee_project_id"])
+    print("Google Earth Engine initialized.")
+except Exception:
+    ee.Authenticate()
+    ee.Initialize(project=CONFIG["gee_project_id"])
+    print("Google Earth Engine initialized after authentication.")
+
+# ------------------------------------------------------------
+# 4. [FIX-1] Load municipality and grid — correct SJC paths
+# ------------------------------------------------------------
+
+muni_path = DIRS["processed"] / "nci_br_sjc_municipality.gpkg"
+grid_path = DIRS["processed"] / "nci_br_sjc_grid_1km.gpkg"
+
+muni_gdf = gpd.read_file(muni_path)
+grid_gdf = gpd.read_file(grid_path)
+
+if muni_gdf.crs is None:
+    muni_gdf = muni_gdf.set_crs("EPSG:4674")
+if grid_gdf.crs is None:
+    grid_gdf = grid_gdf.set_crs(plot_crs)
+
+muni_ee  = geemap.geopandas_to_ee(muni_gdf.to_crs("EPSG:4326"))
+grid_ee  = geemap.geopandas_to_ee(grid_gdf.to_crs("EPSG:4326"))
+aoi_geom = muni_ee.geometry()
+
+print(f"Municipality loaded : {MUNICIPALITY}")
+print(f"Grid loaded         : {len(grid_gdf)} cells")
+
+# ------------------------------------------------------------
+# 5. Analysis period and baseline year
+# ------------------------------------------------------------
+
+NDVI_START_YEAR = 2015
+NDVI_END_YEAR   = 2024
+YEARS           = list(range(NDVI_START_YEAR, NDVI_END_YEAR + 1))
+
+# [FIX-9] Clamp BASELINE_YEAR to the analysis range
+BASELINE_YEAR = int(CONFIG["baseline_year"])
+if not (NDVI_START_YEAR <= BASELINE_YEAR <= NDVI_END_YEAR):
+    BASELINE_YEAR = NDVI_END_YEAR
+    print(f"  WARNING: CONFIG baseline_year outside analysis range. "
+          f"Using {BASELINE_YEAR}.")
+
+print(f"\nVegetation analysis period : {NDVI_START_YEAR}–{NDVI_END_YEAR}")
+print(f"Baseline year              : {BASELINE_YEAR}")
+
+# ------------------------------------------------------------
+# 6. Helper: clip_image_to_aoi (redefined inline)
+# ------------------------------------------------------------
+
+def clip_image_to_aoi(image: ee.Image, aoi_geometry: ee.Geometry) -> ee.Image:
+    """Clip and mask an ee.Image to the exact municipal boundary."""
+    return (
+        image
+        .clip(aoi_geometry)
+        .updateMask(ee.Image.constant(1).clip(aoi_geometry).unmask(0))
+    )
+
+# ------------------------------------------------------------
+# 7. Landsat Collection 2 Level 2 preprocessing functions
+# ------------------------------------------------------------
+
+def mask_landsat_c2_l2(image: ee.Image) -> ee.Image:
+    """
+    Apply QA_PIXEL cloud/shadow/snow mask and convert to
+    surface reflectance (scale factor 0.0000275, offset -0.2).
+    Bits masked: 1=dilated cloud, 2=cirrus, 3=cloud,
+                 4=cloud shadow, 5=snow.
+    """
+    qa = image.select("QA_PIXEL")
+    mask = (
+        qa.bitwiseAnd(1 << 1).eq(0)
+        .And(qa.bitwiseAnd(1 << 2).eq(0))
+        .And(qa.bitwiseAnd(1 << 3).eq(0))
+        .And(qa.bitwiseAnd(1 << 4).eq(0))
+        .And(qa.bitwiseAnd(1 << 5).eq(0))
+    )
+    optical = image.select("SR_B.*").multiply(0.0000275).add(-0.2)
+    return image.addBands(optical, None, True).updateMask(mask)
+
+
+def rename_landsat_8_9(image: ee.Image) -> ee.Image:
+    """Rename Landsat 8/9 bands to generic names."""
+    return image.select(
+        ["SR_B2", "SR_B3", "SR_B4", "SR_B5", "SR_B6", "SR_B7"],
+        ["blue",  "green", "red",   "nir",   "swir1", "swir2"]
+    ).copyProperties(image, image.propertyNames())
+
+
+def add_indices(image: ee.Image) -> ee.Image:
+    """
+    Compute NDVI and EVI, clamped to [-1, 1].
+    [IMP-1] Clamping removes extreme outliers over water/shadow.
+    """
+    ndvi = (
+        image.normalizedDifference(["nir", "red"])
+        .rename("NDVI")
+        .clamp(-1, 1)
+    )
+    evi = (
+        image.expression(
+            "2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))",
+            {"NIR": image.select("nir"),
+             "RED": image.select("red"),
+             "BLUE": image.select("blue")}
+        )
+        .rename("EVI")
+        .clamp(-1, 1)
+    )
+    return image.addBands([ndvi, evi])
+
+
+def get_landsat_collection(
+    start_date: str,
+    end_date: str,
+    geometry: ee.Geometry
+) -> ee.ImageCollection:
+    """Merge Landsat 8 and 9 C2L2, masked and with indices."""
+    l8 = (
+        ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+        .filterDate(start_date, end_date)
+        .filterBounds(geometry)
+        .map(mask_landsat_c2_l2)
+        .map(rename_landsat_8_9)
+        .map(add_indices)
+    )
+    l9 = (
+        ee.ImageCollection("LANDSAT/LC09/C02/T1_L2")
+        .filterDate(start_date, end_date)
+        .filterBounds(geometry)
+        .map(mask_landsat_c2_l2)
+        .map(rename_landsat_8_9)
+        .map(add_indices)
+    )
+    return l8.merge(l9)
+
+# ------------------------------------------------------------
+# 8. Build annual and seasonal NDVI/EVI composites
+# ------------------------------------------------------------
+# Annual  : full calendar year median
+# Dry     : April–September (main signal for native vegetation in SP)
+# [IMP-2] Dry-season composite separates native veg from cropland signal
+
+annual_images   = []
+dry_images      = []
+n_obs_images    = []   # [NEW-1] valid observation count
+
+for year in YEARS:
+    # Annual composite
+    annual_col = get_landsat_collection(
+        f"{year}-01-01", f"{year}-12-31", aoi_geom
+    )
+
+    # [NEW-1] Count valid pixels per cell
+    n_obs = (
+        annual_col.select("NDVI")
+        .count()
+        .rename("n_obs")
+        .set("year", year)
+    )
+    n_obs_images.append(n_obs)
+
+    annual_comp = (
+        annual_col.select(["NDVI", "EVI"]).median()
+        .set("year", year)
+        .set("system:time_start", ee.Date(f"{year}-01-01").millis())
+    )
+    # [FIX-2] Apply clip_image_to_aoi
+    annual_images.append(clip_image_to_aoi(annual_comp, aoi_geom))
+
+    # [IMP-2] Dry-season composite (April–September)
+    dry_col = get_landsat_collection(
+        f"{year}-04-01", f"{year}-09-30", aoi_geom
+    )
+    dry_comp = (
+        dry_col.select(["NDVI", "EVI"]).median()
+        .set("year", year)
+        .set("system:time_start", ee.Date(f"{year}-04-01").millis())
+    )
+    dry_images.append(clip_image_to_aoi(dry_comp, aoi_geom))
+
+annual_ic = ee.ImageCollection(annual_images)
+dry_ic    = ee.ImageCollection(dry_images)
+n_obs_ic  = ee.ImageCollection(n_obs_images)
+
+print("Annual and dry-season NDVI/EVI composites created.")
+
+# ------------------------------------------------------------
+# 9. AOI-level annual vegetation statistics
+# ------------------------------------------------------------
+
+print(f"\nComputing AOI-level NDVI/EVI statistics {NDVI_START_YEAR}–{NDVI_END_YEAR}...")
+
+records = []
+
+for year in YEARS:
+    img = annual_ic.filter(ee.Filter.eq("year", year)).first()
+
+    stats = img.reduceRegion(
+        reducer=(
+            ee.Reducer.mean()
+            .combine(ee.Reducer.median(),  sharedInputs=True)
+            .combine(ee.Reducer.stdDev(),  sharedInputs=True)
+            .combine(ee.Reducer.percentile([10, 25, 75, 90]), sharedInputs=True)
+        ),
+        geometry=aoi_geom,
+        scale=30, maxPixels=1e13, bestEffort=True
+    ).getInfo()
+
+    row = {"year": year}
+    for key, value in stats.items():
+        try:
+            row[key] = float(value) if value is not None else np.nan
+        except Exception:
+            row[key] = np.nan
+    records.append(row)
+
+    if year % 5 == 0:
+        print(f"  {year} processed...")
+
+aoi_veg_df = pd.DataFrame(records)
+
+aoi_veg_path = DIRS["tables"] / "nci_br_sjc_landsat_ndvi_evi_annual_stats.csv"
+aoi_veg_df.to_csv(aoi_veg_path, index=False, encoding="utf-8-sig")
+print(f"AOI vegetation statistics exported: {aoi_veg_path}")
+logger.info(f"AOI vegetation stats: {len(aoi_veg_df)} years")
+
+# ------------------------------------------------------------
+# 10. Vegetation condition stack for baseline year
+# ------------------------------------------------------------
+
+baseline_img = annual_ic.filter(ee.Filter.eq("year", BASELINE_YEAR)).first()
+dry_baseline = dry_ic.filter(ee.Filter.eq("year", BASELINE_YEAR)).first()
+
+ndvi_baseline     = baseline_img.select("NDVI").rename(f"NDVI_{BASELINE_YEAR}")
+evi_baseline      = baseline_img.select("EVI").rename(f"EVI_{BASELINE_YEAR}")
+ndvi_dry_baseline = dry_baseline.select("NDVI").rename(f"NDVI_dry_{BASELINE_YEAR}")
+
+# Multi-year mean condition (full series)
+mean_ndvi = annual_ic.select("NDVI").mean().rename("NDVI_mean_series")
+mean_evi  = annual_ic.select("EVI").mean().rename("EVI_mean_series")
+
+# [IMP-3] Coefficient of variation as trend-stability proxy
+std_ndvi = annual_ic.select("NDVI").reduce(ee.Reducer.stdDev()).rename("NDVI_stddev_series")
+cv_ndvi  = std_ndvi.divide(mean_ndvi.abs().add(1e-6)).rename("NDVI_cv_series")
+
+# [NEW-1] Mean valid observations per year
+mean_n_obs = n_obs_ic.mean().rename("mean_n_obs_per_yr")
+
+# ------------------------------------------------------------
+# 11. Linear trend (NDVI slope) — 2015→2024
+# ------------------------------------------------------------
+
+def add_time_band(image: ee.Image) -> ee.Image:
+    """Add a float 'time' band equal to the 'year' property."""
+    return image.addBands(
+        ee.Image.constant(ee.Number(image.get("year"))).rename("time").float()
+    )
+
+annual_with_time = annual_ic.map(add_time_band)
+dry_with_time    = dry_ic.map(add_time_band)
+
+# linearFit: band order [independent=time, dependent=NDVI/EVI]
+ndvi_trend = (
+    annual_with_time.select(["time", "NDVI"])
+    .reduce(ee.Reducer.linearFit())
+    .select("scale")
+    .rename("NDVI_slope_series")
+)
+evi_trend = (
+    annual_with_time.select(["time", "EVI"])
+    .reduce(ee.Reducer.linearFit())
+    .select("scale")
+    .rename("EVI_slope_series")
+)
+ndvi_dry_trend = (
+    dry_with_time.select(["time", "NDVI"])
+    .reduce(ee.Reducer.linearFit())
+    .select("scale")
+    .rename("NDVI_dry_slope_series")
+)
+
+# Stack all indicators into a single multi-band image
+veg_stack = (
+    ndvi_baseline
+    .addBands(evi_baseline)
+    .addBands(ndvi_dry_baseline)
+    .addBands(mean_ndvi)
+    .addBands(mean_evi)
+    .addBands(ndvi_trend)
+    .addBands(evi_trend)
+    .addBands(ndvi_dry_trend)
+    .addBands(cv_ndvi)
+    .addBands(mean_n_obs)
+)
+
+print("Vegetation indicator stack assembled.")
+
+# ------------------------------------------------------------
+# 12. Extract vegetation indicators per 1-km grid cell
+# ------------------------------------------------------------
+
+print(f"\nExtracting vegetation indicators per 1-km grid cell...")
+
+# [FIX-10] tileScale=4 prevents out-of-memory on large grids
+grid_veg_ee = veg_stack.reduceRegions(
+    collection=grid_ee,
+    reducer=(
+        ee.Reducer.mean()
+        .combine(ee.Reducer.median(), sharedInputs=True)
+        .combine(ee.Reducer.stdDev(), sharedInputs=True)
+    ),
+    scale=30,
+    tileScale=4
+)
+
+# Note: if geemap.ee_to_gdf times out, use Export instead:
+#
+#   task = ee.batch.Export.table.toDrive(
+#       collection  = grid_veg_ee,
+#       description = f"nci_br_sjc_grid_vegetation_{NDVI_END_YEAR}",
+#       folder      = "NCI_BR_Exports",
+#       fileFormat  = "CSV"
+#   )
+#   task.start()
+#   print(f"Export task started: {task.id}")
+
+grid_veg_gdf = geemap.ee_to_gdf(grid_veg_ee)
+
+if grid_veg_gdf.crs is None:
+    grid_veg_gdf = grid_veg_gdf.set_crs("EPSG:4326")
+
+# [FIX-8] Output filenames follow nci_br_sjc_* pattern
+grid_veg_path = DIRS["processed"] / "nci_br_sjc_grid_vegetation_condition.gpkg"
+grid_veg_csv  = DIRS["tables"]    / "nci_br_sjc_grid_vegetation_condition.csv"
+
+grid_veg_gdf.to_file(grid_veg_path, layer="grid_vegetation", driver="GPKG")
+
+# [FIX-3] pd.DataFrame() before CSV export
+pd.DataFrame(grid_veg_gdf.drop(columns="geometry")).to_csv(
+    grid_veg_csv, index=False, encoding="utf-8-sig"
+)
+
+print(f"Grid vegetation GPKG : {grid_veg_path}")
+print(f"Grid vegetation CSV  : {grid_veg_csv}")
+logger.info(f"Grid vegetation: {len(grid_veg_gdf)} cells")
+
+# ------------------------------------------------------------
+# 13. Summary statistics per indicator
+# ------------------------------------------------------------
+
+# [IMP-5] Dynamically detect available NDVI/EVI columns
+veg_numeric_cols = sorted([
+    col for col in grid_veg_gdf.columns
+    if any(k in col for k in ["NDVI", "EVI", "n_obs"])
+    and col != "geometry"
+])
+
+summary_records = []
+for col in veg_numeric_cols:
+    values = pd.to_numeric(grid_veg_gdf[col], errors="coerce")
+    summary_records.append({
+        "indicator": col,
+        "mean":    round(float(values.mean()),            4),
+        "median":  round(float(values.median()),          4),
+        "std":     round(float(values.std()),             4),
+        "min":     round(float(values.min()),             4),
+        "q10":     round(float(values.quantile(0.10)),    4),
+        "q25":     round(float(values.quantile(0.25)),    4),
+        "q75":     round(float(values.quantile(0.75)),    4),
+        "q90":     round(float(values.quantile(0.90)),    4),
+        "max":     round(float(values.max()),             4),
+        "n_cells": int(values.notna().sum()),
+    })
+
+veg_summary_df   = pd.DataFrame(summary_records)
+veg_summary_path = DIRS["tables"] / "nci_br_sjc_grid_vegetation_summary.csv"
+veg_summary_df.to_csv(veg_summary_path, index=False, encoding="utf-8-sig")
+print(f"Summary statistics: {veg_summary_path}")
+
+# ------------------------------------------------------------
+# 14. Prepare plotting layers
+# ------------------------------------------------------------
+
+plot_gdf   = grid_veg_gdf.to_crs(plot_crs)
+muni_plot  = muni_gdf.to_crs(plot_crs)
+
+# Numeric cast for all indicator columns
+for col in veg_numeric_cols:
+    if col in plot_gdf.columns:
+        plot_gdf[col] = pd.to_numeric(plot_gdf[col], errors="coerce")
+
+# [FIX-7] Consistent map extent with buffer
+xmin, ymin, xmax, ymax = muni_plot.total_bounds
+xbuf = (xmax - xmin) * 0.05
+ybuf = (ymax - ymin) * 0.05
+map_extent = [xmin - xbuf, xmax + xbuf, ymin - ybuf, ymax + ybuf]
+
+
+def overlay_boundary(ax, gdf):
+    """Overlay municipal boundary on a map panel."""
+    gdf.boundary.plot(ax=ax, edgecolor="black", linewidth=1.2, zorder=5)
+
+
+def set_map_extent(ax):
+    """Apply consistent map extent and remove axis ticks."""
+    ax.set_xlim(map_extent[0], map_extent[1])
+    ax.set_ylim(map_extent[2], map_extent[3])
+    ax.set_axis_off()
+
+
+def add_panel_label(ax, label):
+    ax.text(0.02, 0.97, label, transform=ax.transAxes,
+            fontsize=12, fontweight="bold", va="top", ha="left",
+            bbox=dict(facecolor="white", edgecolor="none",
+                      alpha=0.88, boxstyle="round,pad=0.22"))
+
+# Resolve actual column names (may vary with GEE reducer output)
+ndvi_base_col  = next((c for c in plot_gdf.columns
+                        if f"NDVI_{BASELINE_YEAR}" in c and c.endswith("_mean")), None)
+mean_ndvi_col  = next((c for c in plot_gdf.columns
+                        if "NDVI_mean_series" in c and c.endswith("_mean")), None)
+slope_ndvi_col = next((c for c in plot_gdf.columns
+                        if "NDVI_slope_series" in c and c.endswith("_mean")), None)
+ndvi_dry_col   = next((c for c in plot_gdf.columns
+                        if f"NDVI_dry_{BASELINE_YEAR}" in c and c.endswith("_mean")), None)
+cv_ndvi_col    = next((c for c in plot_gdf.columns
+                        if "NDVI_cv_series" in c and c.endswith("_mean")), None)
+n_obs_col      = next((c for c in plot_gdf.columns
+                        if "mean_n_obs" in c and c.endswith("_mean")), None)
+
+print(f"\nKey columns resolved:")
+for name, col in [("NDVI baseline", ndvi_base_col),
+                   ("NDVI mean",     mean_ndvi_col),
+                   ("NDVI slope",    slope_ndvi_col),
+                   ("NDVI dry",      ndvi_dry_col),
+                   ("CV NDVI",       cv_ndvi_col),
+                   ("N obs",         n_obs_col)]:
+    print(f"  {name:<16}: {col}")
+
+# ------------------------------------------------------------
+# 15. High-quality composite figure — 9 panels
+# ------------------------------------------------------------
+
+plt.rcParams.update({
+    "figure.dpi": 150, "savefig.dpi": CONFIG["figure_dpi"],
+    "font.family": "DejaVu Sans", "font.size": 9.5,
+    "axes.titlesize": 10, "axes.labelsize": 9,
+    "legend.fontsize": 8.5, "axes.linewidth": 0.7,
+    "pdf.fonttype": 42, "ps.fonttype": 42, "savefig.bbox": "tight",
+})
+
+fig = plt.figure(figsize=(16, 11), dpi=150)
+gs  = fig.add_gridspec(
+    nrows=3, ncols=3,
+    width_ratios=[1.2, 1.2, 1.0],
+    height_ratios=[1, 1, 1],
+    wspace=0.22, hspace=0.32
+)
+
+ax_a = fig.add_subplot(gs[0, 0])
+ax_b = fig.add_subplot(gs[0, 1])
+ax_c = fig.add_subplot(gs[0, 2])
+ax_d = fig.add_subplot(gs[1, 0])
+ax_e = fig.add_subplot(gs[1, 1])
+ax_f = fig.add_subplot(gs[1, 2])
+ax_g = fig.add_subplot(gs[2, 0])
+ax_h = fig.add_subplot(gs[2, 1])
+ax_i = fig.add_subplot(gs[2, 2])
+
+# ── Panel a — Annual NDVI trajectory ─────────────────────────
+ndvi_mean_col = "NDVI_mean" if "NDVI_mean" in aoi_veg_df.columns else None
+if ndvi_mean_col:
+    ax_a.plot(aoi_veg_df["year"], aoi_veg_df[ndvi_mean_col],
+              color="#1a7a3c", linewidth=2.2, marker="o", markersize=3.5)
+    ax_a.fill_between(aoi_veg_df["year"], aoi_veg_df[ndvi_mean_col],
+                      alpha=0.12, color="#1a7a3c")
+    # 10th–90th percentile band
+    if "NDVI_p10" in aoi_veg_df.columns and "NDVI_p90" in aoi_veg_df.columns:
+        ax_a.fill_between(aoi_veg_df["year"],
+                          aoi_veg_df["NDVI_p10"], aoi_veg_df["NDVI_p90"],
+                          alpha=0.08, color="#1a7a3c", label="P10–P90")
+ax_a.set_title(f"AOI mean NDVI trajectory ({NDVI_START_YEAR}–{NDVI_END_YEAR})", loc="left")
+ax_a.set_xlabel("Year")
+ax_a.set_ylabel("NDVI")
+ax_a.grid(True, linewidth=0.3, alpha=0.5)
+add_panel_label(ax_a, "a")
+
+# ── Panel b — Annual EVI trajectory ──────────────────────────
+evi_mean_col = "EVI_mean" if "EVI_mean" in aoi_veg_df.columns else None
+if evi_mean_col:
+    ax_b.plot(aoi_veg_df["year"], aoi_veg_df[evi_mean_col],
+              color="#1d6ba0", linewidth=2.2, marker="o", markersize=3.5)
+    ax_b.fill_between(aoi_veg_df["year"], aoi_veg_df[evi_mean_col],
+                      alpha=0.12, color="#1d6ba0")
+ax_b.set_title(f"AOI mean EVI trajectory ({NDVI_START_YEAR}–{NDVI_END_YEAR})", loc="left")
+ax_b.set_xlabel("Year")
+ax_b.set_ylabel("EVI")
+ax_b.grid(True, linewidth=0.3, alpha=0.5)
+add_panel_label(ax_b, "b")
+
+# ── Panel c — Summary statistics table ───────────────────────
+ax_c.axis("off")
+
+# [IMP-5] Dynamically select rows available in veg_summary_df
+priority_keys = [
+    f"NDVI_{BASELINE_YEAR}_mean",
+    f"EVI_{BASELINE_YEAR}_mean",
+    "NDVI_mean_series_mean",
+    "NDVI_dry_slope_series_mean",
+    "NDVI_slope_series_mean",
+    "NDVI_cv_series_mean",
+]
+sel_rows = veg_summary_df[
+    veg_summary_df["indicator"].isin(priority_keys)
+].copy()
+
+if len(sel_rows) == 0:
+    # Fallback: first 6 available NDVI/EVI rows
+    sel_rows = veg_summary_df[
+        veg_summary_df["indicator"].str.contains("NDVI|EVI")
+    ].head(6).copy()
+
+sel_rows["indicator"] = (
+    sel_rows["indicator"]
+    .str.replace(f"_{BASELINE_YEAR}", "", regex=False)
+    .str.replace("_series", "", regex=False)
+    .str.replace("_mean$", "", regex=True)
+    .str.replace("_", " ")
+)
+for col in ["mean", "median", "q90"]:
+    sel_rows[col] = sel_rows[col].map(lambda x: f"{x:.4f}")
+
+table = ax_c.table(
+    cellText=sel_rows[["indicator", "mean", "median", "q90"]].values,
+    colLabels=["Indicator", "Mean", "Median", "Q90"],
+    loc="center", cellLoc="center"
+)
+table.auto_set_font_size(False)
+table.set_fontsize(7.5)
+table.scale(1.0, 1.35)
+for (row, col), cell in table.get_celld().items():
+    cell.set_edgecolor("#bdbdbd")
+    cell.set_linewidth(0.5)
+    if row == 0:
+        cell.set_facecolor("#f0f0f0")
+        cell.set_text_props(weight="bold")
+ax_c.set_title("Grid vegetation statistics (cell means)", loc="left")
+add_panel_label(ax_c, "c")
+
+# ── Panel d — Baseline NDVI map ───────────────────────────────
+if ndvi_base_col and ndvi_base_col in plot_gdf.columns:
+    plot_gdf.plot(
+        column=ndvi_base_col, ax=ax_d,
+        cmap="YlGn", linewidth=0.0, legend=True,
+        legend_kwds={"label": "NDVI (−1 to 1)", "shrink": 0.7},  # [IMP-4]
+        missing_kwds={"color": "lightgrey"},
+        vmin=-0.1, vmax=0.9
+    )
+overlay_boundary(ax_d, muni_plot)  # [FIX-6]
+set_map_extent(ax_d)               # [FIX-7]
+ax_d.set_title(f"NDVI per 1-km cell — baseline ({BASELINE_YEAR})", loc="left")
+add_panel_label(ax_d, "d")
+
+# ── Panel e — Mean NDVI 2015–2024 map ────────────────────────
+if mean_ndvi_col and mean_ndvi_col in plot_gdf.columns:
+    plot_gdf.plot(
+        column=mean_ndvi_col, ax=ax_e,
+        cmap="YlGn", linewidth=0.0, legend=True,
+        legend_kwds={"label": "Mean NDVI (−1 to 1)", "shrink": 0.7},  # [IMP-4]
+        missing_kwds={"color": "lightgrey"},
+        vmin=-0.1, vmax=0.9
+    )
+overlay_boundary(ax_e, muni_plot)
+set_map_extent(ax_e)
+ax_e.set_title(f"Mean NDVI per 1-km cell ({NDVI_START_YEAR}–{NDVI_END_YEAR})", loc="left")
+add_panel_label(ax_e, "e")
+
+# ── Panel f — NDVI trend (slope) map ─────────────────────────
+if slope_ndvi_col and slope_ndvi_col in plot_gdf.columns:
+    slope_vals = plot_gdf[slope_ndvi_col].dropna()
+    if len(slope_vals) > 0:
+        vmax_abs = max(abs(float(slope_vals.quantile(0.02))),
+                       abs(float(slope_vals.quantile(0.98))), 0.001)
+        norm_div = TwoSlopeNorm(vmin=-vmax_abs, vcenter=0, vmax=vmax_abs)
+        plot_gdf.plot(
+            column=slope_ndvi_col, ax=ax_f,
+            cmap="RdYlGn", norm=norm_div, linewidth=0.0, legend=True,
+            legend_kwds={"label": "NDVI slope (NDVI/yr)", "shrink": 0.7},  # [IMP-4]
+            missing_kwds={"color": "lightgrey"}
+        )
+overlay_boundary(ax_f, muni_plot)
+set_map_extent(ax_f)
+ax_f.set_title(f"NDVI trend per 1-km cell ({NDVI_START_YEAR}–{NDVI_END_YEAR})", loc="left")
+add_panel_label(ax_f, "f")
+
+# ── Panel g — Dry-season NDVI (baseline) ─────────────────────
+if ndvi_dry_col and ndvi_dry_col in plot_gdf.columns:
+    plot_gdf.plot(
+        column=ndvi_dry_col, ax=ax_g,
+        cmap="YlGn", linewidth=0.0, legend=True,
+        legend_kwds={"label": "Dry-season NDVI (−1 to 1)", "shrink": 0.7},
+        missing_kwds={"color": "lightgrey"},
+        vmin=-0.1, vmax=0.9
+    )
+overlay_boundary(ax_g, muni_plot)
+set_map_extent(ax_g)
+ax_g.set_title(f"Dry-season NDVI per 1-km cell ({BASELINE_YEAR})", loc="left")
+add_panel_label(ax_g, "g")
+
+# ── Panel h — NDVI coefficient of variation ──────────────────
+if cv_ndvi_col and cv_ndvi_col in plot_gdf.columns:
+    plot_gdf.plot(
+        column=cv_ndvi_col, ax=ax_h,
+        cmap="OrRd", linewidth=0.0, legend=True,
+        legend_kwds={"label": "NDVI CV (dimensionless)", "shrink": 0.7},
+        missing_kwds={"color": "lightgrey"}
+    )
+overlay_boundary(ax_h, muni_plot)
+set_map_extent(ax_h)
+ax_h.set_title(f"NDVI inter-annual variability (CV, {NDVI_START_YEAR}–{NDVI_END_YEAR})", loc="left")
+add_panel_label(ax_h, "h")
+
+# ── Panel i — Valid observation count per year ────────────────
+if n_obs_col and n_obs_col in plot_gdf.columns:
+    plot_gdf.plot(
+        column=n_obs_col, ax=ax_i,
+        cmap="Blues", linewidth=0.0, legend=True,
+        legend_kwds={"label": "Mean valid obs. / yr", "shrink": 0.7},
+        missing_kwds={"color": "lightgrey"}
+    )
+overlay_boundary(ax_i, muni_plot)
+set_map_extent(ax_i)
+ax_i.set_title(f"Mean valid Landsat obs. per year per cell", loc="left")
+add_panel_label(ax_i, "i")
+
+fig.suptitle(
+    f"Vegetation condition and temporal dynamics — NCI-BR | {MUNICIPALITY}, SP",
+    fontsize=13, fontweight="bold", y=0.995
+)
+fig.text(
+    0.02, 0.005,
+    "Data: Landsat 8/9 Collection 2 Level 2 surface reflectance. "
+    "Annual and dry-season median composites, 2015–2024.",
+    fontsize=7.5, color="#4d4d4d"
+)
+
+fig_png = DIRS["figures"] / "figure_03_nci_br_sjc_vegetation_condition.png"
+fig_pdf = DIRS["figures"] / "figure_03_nci_br_sjc_vegetation_condition.pdf"
+
+plt.savefig(fig_png, dpi=CONFIG["figure_dpi"], bbox_inches="tight")
+plt.savefig(fig_pdf, dpi=CONFIG["figure_dpi"], bbox_inches="tight")
+plt.show()
+
+print(f"\nFigure exported:\n  {fig_png}\n  {fig_pdf}")
+logger.info(f"Figure exported: {fig_png}")
+
+# ------------------------------------------------------------
+# 16. MD5 checksums
+# ------------------------------------------------------------
+
+def md5_checksum(fp: Path) -> str:
+    h = hashlib.md5()
+    with open(fp, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+checksum_files = [aoi_veg_path, grid_veg_path]
+checksums      = {fp.name: md5_checksum(fp) for fp in checksum_files}
+checksums_path = DIRS["metadata"] / "nci_br_block04_checksums.json"
+with open(checksums_path, "w") as f:
+    json.dump(checksums, f, indent=4)
+print(f"MD5 checksums: {checksums_path}")
+
+# ------------------------------------------------------------
+# 17. Block metadata
+# ------------------------------------------------------------
+
+block04_metadata = {
+    "block":           "04",
+    "version":         "final",
+    "municipality":    MUNICIPALITY,
+    "analysis_period": [NDVI_START_YEAR, NDVI_END_YEAR],
+    "baseline_year":   BASELINE_YEAR,
+    "datasets": [
+        "LANDSAT/LC08/C02/T1_L2",
+        "LANDSAT/LC09/C02/T1_L2",
+    ],
+    "composites": {
+        "annual":     "full-year median NDVI/EVI",
+        "dry_season": "Apr–Sep median NDVI/EVI",
+    },
+    "indicators": {
+        "baseline_ndvi":     f"NDVI_{BASELINE_YEAR}",
+        "baseline_evi":      f"EVI_{BASELINE_YEAR}",
+        "baseline_ndvi_dry": f"NDVI_dry_{BASELINE_YEAR}",
+        "mean_ndvi_series":  "NDVI_mean_series",
+        "ndvi_slope":        "NDVI_slope_series (NDVI/yr)",
+        "ndvi_cv":           "NDVI_cv_series (inter-annual variability)",
+        "mean_n_obs_per_yr": "mean_n_obs_per_yr",
+    },
+    "outputs": {
+        "aoi_annual_stats":  str(aoi_veg_path),
+        "grid_veg_gpkg":     str(grid_veg_path),
+        "grid_veg_csv":      str(grid_veg_csv),
+        "summary_stats_csv": str(veg_summary_path),
+        "figure_png":        str(fig_png),
+        "figure_pdf":        str(fig_pdf),
+        "checksums":         str(checksums_path),
+    },
+    "created_at": datetime.now().isoformat(),
+}
+
+metadata_path = DIRS["metadata"] / "nci_br_block04_metadata.json"
+with open(metadata_path, "w", encoding="utf-8") as f:
+    json.dump(block04_metadata, f, indent=4, ensure_ascii=False)
+print(f"Metadata saved: {metadata_path}")
+logger.info("Block 04 completed.")
+
+# ------------------------------------------------------------
+# 18. Final summary
+# ------------------------------------------------------------
+
+print("\n" + "=" * 62)
+print(f"BLOCK 04 — COMPLETED | {MUNICIPALITY}")
+print("=" * 62)
+print(f"  Analysis period  : {NDVI_START_YEAR}–{NDVI_END_YEAR}")
+print(f"  Baseline year    : {BASELINE_YEAR}")
+print(f"  Composites built : annual + dry-season (Apr–Sep)")
+print(f"  Grid cells       : {len(grid_veg_gdf)}")
+print(f"  Indicators/cell  : NDVI baseline, EVI baseline,")
+print(f"                     dry-season NDVI, multi-year mean,")
+print(f"                     linear trend (slope), CV, n_obs")
+
+if ndvi_mean_col and ndvi_mean_col in aoi_veg_df.columns:
+    first_val = aoi_veg_df[aoi_veg_df["year"] == NDVI_START_YEAR][ndvi_mean_col].iloc[0]
+    last_val  = aoi_veg_df[aoi_veg_df["year"] == NDVI_END_YEAR][ndvi_mean_col].iloc[0]
+    print(f"\n  AOI mean NDVI {NDVI_START_YEAR} : {first_val:.4f}")
+    print(f"  AOI mean NDVI {NDVI_END_YEAR} : {last_val:.4f}")
+    print(f"  Δ NDVI          : {last_val - first_val:+.4f}")
+
+print("=" * 62)
+print("\nNext block: hydrological regulation and flood-susceptibility")
+print("indicators — terrain, drainage proximity, and lowland metrics.")
