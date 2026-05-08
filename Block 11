@@ -1,0 +1,860 @@
+# ============================================================
+# BRAZIL NCI-BR PROJECT
+# BLOCK 11 — SCIENTIFIC QA/QC AND REPRODUCIBILITY AUDIT
+# REAL OUTPUTS ONLY — NO NEW DATA GENERATION
+# FOCUS: SÃO JOSÉ DOS CAMPOS — SP, BRAZIL
+# ============================================================
+#
+# Corrections applied:
+#   [FIX-1]  All expected file paths updated to nci_br_sjc_* pattern
+#   [FIX-2]  DIRS creation loop added
+#   [FIX-3]  plot_crs defined at block start
+#   [FIX-4]  Attribute checks use find_column() with old + new names
+#   [FIX-5]  All output filenames follow nci_br_sjc_qaqc_* pattern
+#   [FIX-6]  QA/QC dashboard figure added (matplotlib imported)
+#   [FIX-7]  Expected files expanded to cover all 10 blocks
+#   [FIX-8]  MD5 checksum verification against Block 10 checksums
+#   [FIX-9]  Audit severity split: critical vs warnings
+#   [IMP-1]  Column count check per dataset added
+#   [IMP-2]  CRS consistency check across all grid datasets
+#   [IMP-3]  Block 10 outputs manifest used as reference
+#   [NEW-1]  Full reproducibility report JSON exported
+# ============================================================
+
+import json
+import logging
+import hashlib
+from pathlib import Path
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+
+# ------------------------------------------------------------
+# 1. Reload project configuration
+# ------------------------------------------------------------
+
+PROJECT_ROOT = Path("/content/drive/MyDrive/Brazil/NCI_BR_Project")
+
+DIRS = {
+    "root":         PROJECT_ROOT,
+    "raw":          PROJECT_ROOT / "01_raw",
+    "intermediate": PROJECT_ROOT / "02_intermediate",
+    "processed":    PROJECT_ROOT / "03_processed",
+    "tables":       PROJECT_ROOT / "04_tables",
+    "figures":      PROJECT_ROOT / "05_figures",
+    "maps":         PROJECT_ROOT / "06_maps",
+    "exports":      PROJECT_ROOT / "07_exports",
+    "logs":         PROJECT_ROOT / "08_logs",
+    "metadata":     PROJECT_ROOT / "09_metadata",
+}
+
+# [FIX-2] Create directories
+for d in DIRS.values():
+    d.mkdir(parents=True, exist_ok=True)
+
+config_path = DIRS["metadata"] / "nci_br_config.json"
+with open(config_path, "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
+
+# [FIX-3]
+plot_crs      = CONFIG.get("output_crs", "EPSG:5880")
+MUNICIPALITY  = "São José dos Campos"
+TARGET_YEAR   = int(CONFIG["baseline_year"])
+START_YEAR    = int(CONFIG["analysis_year_start"])
+
+# ------------------------------------------------------------
+# 2. Logging
+# ------------------------------------------------------------
+
+log_file = DIRS["logs"] / f"nci_br_block11_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+logging.basicConfig(
+    filename=log_file, level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger("NCI_BR_BLOCK11")
+logger.info(f"Block 11 QA/QC started — {MUNICIPALITY}.")
+print(f"Log file: {log_file}")
+
+# ------------------------------------------------------------
+# 3. Helper functions
+# ------------------------------------------------------------
+
+def safe_read_gpkg(path: Path) -> gpd.GeoDataFrame | None:
+    return gpd.read_file(path) if path.exists() else None
+
+
+def safe_read_csv(path: Path) -> pd.DataFrame | None:
+    return pd.read_csv(path) if path.exists() else None
+
+
+def find_column(df: pd.DataFrame | None, candidates: list) -> str | None:
+    if df is None:
+        return None
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def md5_checksum(fp: Path) -> str:
+    h = hashlib.md5()
+    with open(fp, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+# ------------------------------------------------------------
+# 4. [FIX-1 / FIX-7] Expected files — full nci_br_sjc_* inventory
+# ------------------------------------------------------------
+# Split into CRITICAL (required for results to be valid) and
+# SUPPLEMENTARY (nice to have but block can still pass without them).
+
+CRITICAL_FILES = {
+    "config":             DIRS["metadata"]  / "nci_br_config.json",
+    "municipality_gpkg":  DIRS["processed"] / "nci_br_sjc_municipality.gpkg",
+    "grid_1km_gpkg":      DIRS["processed"] / "nci_br_sjc_grid_1km.gpkg",
+    "grid_lulc_gpkg":     DIRS["processed"] / f"nci_br_sjc_grid_lulc_{TARGET_YEAR}.gpkg",
+    "grid_veg_gpkg":      DIRS["processed"] / "nci_br_sjc_grid_vegetation_condition.gpkg",
+    "grid_hydro_gpkg":    DIRS["processed"] / "nci_br_sjc_grid_hydrological_indicators.gpkg",
+    "nci_integrated_gpkg":DIRS["processed"] / "nci_br_sjc_grid_integrated_index.gpkg",
+    "spatial_stats_gpkg": DIRS["processed"] / "nci_br_sjc_spatial_statistics.gpkg",
+    "observed_conv_gpkg": DIRS["processed"] / "nci_br_sjc_observed_conversion.gpkg",
+    "evidence_synth_gpkg":DIRS["processed"] / "nci_br_sjc_evidence_synthesis.gpkg",
+    "priority_cells_gpkg":DIRS["processed"] / "nci_br_sjc_final_priority_cells.gpkg",
+    "final_results_csv":  DIRS["tables"]    / "nci_br_sjc_final_manuscript_results.csv",
+    "fig_final_png":      DIRS["figures"]   / "figure_09_nci_br_sjc_final_output_package.png",
+}
+
+SUPPLEMENTARY_FILES = {
+    "lulc_trajectories":  DIRS["tables"]  / f"nci_br_sjc_mapbiomas_trajectories_{START_YEAR}_{TARGET_YEAR}.csv",
+    "annual_urban_traj":  DIRS["tables"]  / "nci_br_sjc_urban_trajectory_annual.csv",
+    "global_morans_i":    DIRS["tables"]  / "nci_br_sjc_global_morans_i.csv",
+    "lisa_summary":       DIRS["tables"]  / "nci_br_sjc_lisa_cluster_summary.csv",
+    "sensitivity_csv":    DIRS["tables"]  / "nci_br_sjc_index_sensitivity_scenarios.csv",
+    "negotiation_table":  DIRS["tables"]  / "nci_br_sjc_negotiation_table.csv",
+    "outputs_manifest":   DIRS["metadata"]/ "nci_br_sjc_outputs_manifest.csv",
+    "fig_final_pdf":      DIRS["figures"] / "figure_09_nci_br_sjc_final_output_package.pdf",
+}
+
+ALL_FILES = {**CRITICAL_FILES, **SUPPLEMENTARY_FILES}
+
+file_audit_records = []
+for name, path in ALL_FILES.items():
+    exists  = path.exists()
+    size_mb = round(path.stat().st_size / 1e6, 3) if exists else np.nan
+    file_audit_records.append({
+        "output_name": name,
+        "criticality": "critical" if name in CRITICAL_FILES else "supplementary",
+        "filename":    path.name,
+        "exists":      exists,
+        "size_mb":     size_mb,
+    })
+
+file_audit = pd.DataFrame(file_audit_records)
+
+n_critical_present  = int(file_audit[file_audit["criticality"] == "critical"]["exists"].sum())
+n_critical_total    = int((file_audit["criticality"] == "critical").sum())
+n_supp_present      = int(file_audit[file_audit["criticality"] == "supplementary"]["exists"].sum())
+
+print(f"\nFile audit:")
+print(f"  Critical    : {n_critical_present}/{n_critical_total} present")
+print(f"  Supplementary: {n_supp_present}/{len(SUPPLEMENTARY_FILES)} present")
+
+# ------------------------------------------------------------
+# 5. Load key datasets for QA/QC
+# ------------------------------------------------------------
+
+grid_gdf      = safe_read_gpkg(CRITICAL_FILES["grid_1km_gpkg"])
+nci_gdf       = safe_read_gpkg(CRITICAL_FILES["nci_integrated_gpkg"])
+spatial_gdf   = safe_read_gpkg(CRITICAL_FILES["spatial_stats_gpkg"])
+observed_gdf  = safe_read_gpkg(CRITICAL_FILES["observed_conv_gpkg"])
+synthesis_gdf = safe_read_gpkg(CRITICAL_FILES["evidence_synth_gpkg"])
+final_results = safe_read_csv(CRITICAL_FILES["final_results_csv"])
+lulc_traj     = safe_read_csv(SUPPLEMENTARY_FILES["lulc_trajectories"])
+annual_urban  = safe_read_csv(SUPPLEMENTARY_FILES["annual_urban_traj"])
+
+# ------------------------------------------------------------
+# 6. Geometry and CRS QA/QC
+# ------------------------------------------------------------
+
+DATASETS = {
+    "grid_1km":          grid_gdf,
+    "nci_integrated":    nci_gdf,
+    "spatial_statistics":spatial_gdf,
+    "observed_conv":     observed_gdf,
+    "evidence_synthesis":synthesis_gdf,
+}
+
+geometry_records = []
+for name, gdf in DATASETS.items():
+    if gdf is None:
+        geometry_records.append({
+            "dataset": name, "loaded": False,
+            "n_features": np.nan, "crs": None,
+            "invalid_geom": np.nan, "empty_geom": np.nan,
+            "total_area_ha": np.nan, "n_columns": np.nan,
+        })
+        continue
+
+    crs_text = str(gdf.crs) if gdf.crs else None
+    try:
+        area_ha = float(gdf.to_crs(plot_crs).geometry.area.sum() / 1e4)
+    except Exception:
+        area_ha = np.nan
+
+    geometry_records.append({
+        "dataset":     name,
+        "loaded":      True,
+        "n_features":  len(gdf),
+        "crs":         crs_text,
+        "invalid_geom":int((~gdf.geometry.is_valid).sum()),
+        "empty_geom":  int(gdf.geometry.is_empty.sum()),
+        "total_area_ha": round(area_ha, 2),
+        "n_columns":   len(gdf.columns),   # [IMP-1]
+    })
+
+geometry_audit = pd.DataFrame(geometry_records)
+
+# [IMP-2] CRS consistency check across grid datasets
+loaded_crs = [
+    str(gdf.crs) for gdf in DATASETS.values()
+    if gdf is not None and gdf.crs is not None
+]
+crs_consistent = len(set(loaded_crs)) <= 1
+
+print(f"\nGeometry audit:")
+print(geometry_audit[["dataset", "loaded", "n_features", "n_columns", "invalid_geom"]].to_string(index=False))
+print(f"CRS consistent across datasets: {crs_consistent}")
+
+# ------------------------------------------------------------
+# 7. [FIX-4] Attribute QA/QC — find_column() for both naming conventions
+# ------------------------------------------------------------
+
+attribute_records = []
+
+
+def check_column(
+    dataset_name: str,
+    df,
+    candidates: list,
+    expected_min=None,
+    expected_max=None,
+) -> None:
+    col = find_column(df, candidates)
+    record = {
+        "dataset":        dataset_name,
+        "candidates":     " | ".join(candidates),
+        "resolved_column":col,
+        "exists":         col is not None,
+        "n_non_null":     np.nan,
+        "n_null":         np.nan,
+        "val_min":        np.nan,
+        "val_max":        np.nan,
+        "expected_range": f"{expected_min} to {expected_max}",
+        "range_pass":     False,
+    }
+    if col is not None and df is not None:
+        values = pd.to_numeric(df[col], errors="coerce")
+        vmin, vmax = float(values.min()), float(values.max())
+        range_ok = True
+        if expected_min is not None:
+            range_ok = range_ok and (vmin >= expected_min or np.isnan(vmin))
+        if expected_max is not None:
+            range_ok = range_ok and (vmax <= expected_max or np.isnan(vmax))
+        record.update({
+            "n_non_null":  int(values.notna().sum()),
+            "n_null":      int(values.isna().sum()),
+            "val_min":     round(vmin, 4),
+            "val_max":     round(vmax, 4),
+            "range_pass":  range_ok,
+        })
+    attribute_records.append(record)
+
+
+# NCI-BR components
+for col in ["NCI_BR", "score_native_vegetation",
+            "score_hydrological_regulation", "score_low_anthropic_pressure"]:
+    check_column("nci_integrated", nci_gdf, [col], 0, 100)
+
+# Observed conversion columns — old AND new naming
+check_column(
+    "observed_conv", observed_gdf,
+    [f"new_urban_1985_{TARGET_YEAR}_ha",
+     f"observed_new_urban_1985_{TARGET_YEAR}_ha"],
+    0, None
+)
+check_column(
+    "observed_conv", observed_gdf,
+    [f"native_to_urban_1985_{TARGET_YEAR}_ha"],
+    0, None
+)
+check_column(
+    "observed_conv", observed_gdf,
+    [f"NCI_exposure_1985_{TARGET_YEAR}",
+     f"NCI_exposed_by_observed_conversion_1985_{TARGET_YEAR}"],
+    0, None
+)
+
+# Spatial statistics
+check_column("spatial_statistics", spatial_gdf, ["LISA_I"],  None, None)
+check_column("spatial_statistics", spatial_gdf, ["LISA_p"],  0, 1)
+check_column("spatial_statistics", spatial_gdf, ["GiZScore"],None, None)
+check_column("spatial_statistics", spatial_gdf, ["GiPValue"],0, 1)
+
+attribute_audit = pd.DataFrame(attribute_records)
+
+n_range_pass = int(attribute_audit["range_pass"].sum())
+print(f"\nAttribute audit: {n_range_pass}/{len(attribute_audit)} range checks passed")
+
+# ------------------------------------------------------------
+# 8. Logical consistency checks
+# ------------------------------------------------------------
+
+logic_records = []
+
+
+def logic_check(name: str, passed: bool, detail: str, critical: bool = True) -> None:
+    logic_records.append({
+        "check":    name,
+        "pass":     bool(passed),
+        "critical": critical,
+        "detail":   detail,
+    })
+
+
+# Feature count alignment
+if grid_gdf is not None and nci_gdf is not None:
+    logic_check(
+        "grid_vs_nci_cell_count",
+        len(grid_gdf) == len(nci_gdf),
+        f"grid={len(grid_gdf)}, nci={len(nci_gdf)}"
+    )
+
+if nci_gdf is not None and observed_gdf is not None:
+    logic_check(
+        "nci_vs_observed_cell_count",
+        len(nci_gdf) == len(observed_gdf),
+        f"nci={len(nci_gdf)}, observed={len(observed_gdf)}",
+        critical=False   # merge may legitimately drop cells
+    )
+
+# NCI-BR value range
+if nci_gdf is not None and "NCI_BR" in nci_gdf.columns:
+    v = pd.to_numeric(nci_gdf["NCI_BR"], errors="coerce")
+    logic_check(
+        "nci_range_0_100",
+        float(v.min()) >= 0 and float(v.max()) <= 100,
+        f"min={v.min():.3f}, max={v.max():.3f}"
+    )
+    logic_check(
+        "nci_no_allnull",
+        v.notna().sum() > 0,
+        f"non-null cells: {v.notna().sum()}"
+    )
+
+# Observed conversion non-negative
+if observed_gdf is not None:
+    conv_cols = [
+        c for c in observed_gdf.columns
+        if ("_to_urban_" in c or "new_urban_" in c or "observed_new_urban_" in c)
+        and c.endswith("_ha")
+    ]
+    if conv_cols:
+        min_val = float(observed_gdf[conv_cols].apply(pd.to_numeric, errors="coerce").min().min())
+        logic_check("conversion_non_negative", min_val >= 0, f"min={min_val:.4f}")
+
+# LULC trajectory year coverage
+if lulc_traj is not None and "year" in lulc_traj.columns:
+    logic_check(
+        "lulc_year_coverage",
+        int(lulc_traj["year"].min()) == START_YEAR and int(lulc_traj["year"].max()) == TARGET_YEAR,
+        f"min={lulc_traj['year'].min()}, max={lulc_traj['year'].max()}"
+    )
+
+# Spatial statistics p-values bounded [0, 1]
+if spatial_gdf is not None and "LISA_p" in spatial_gdf.columns:
+    p_vals = pd.to_numeric(spatial_gdf["LISA_p"], errors="coerce")
+    logic_check(
+        "lisa_p_bounded_0_1",
+        float(p_vals.min()) >= 0 and float(p_vals.max()) <= 1,
+        f"p range: [{p_vals.min():.4f}, {p_vals.max():.4f}]"
+    )
+
+# CRS consistency
+logic_check("crs_consistent_across_datasets", crs_consistent,
+            f"Unique CRS values found: {set(loaded_crs)}")
+
+logic_audit = pd.DataFrame(logic_records)
+
+critical_failures = logic_audit[(logic_audit["critical"]) & (~logic_audit["pass"])]["check"].tolist()
+warnings          = logic_audit[(~logic_audit["critical"]) & (~logic_audit["pass"])]["check"].tolist()
+
+print(f"\nLogical checks: {int(logic_audit['pass'].sum())}/{len(logic_audit)} passed")
+if critical_failures: print(f"  Critical failures : {critical_failures}")
+if warnings:          print(f"  Warnings          : {warnings}")
+
+# ------------------------------------------------------------
+# 9. [FIX-8] MD5 checksum verification from Block 10
+# ------------------------------------------------------------
+
+checksum_path = DIRS["metadata"] / "nci_br_block10_checksums.json"
+checksum_records = []
+
+if checksum_path.exists():
+    with open(checksum_path) as f:
+        stored = json.load(f)
+
+    for fname, stored_hash in stored.items():
+        fp = DIRS["processed"] / fname
+        if not fp.exists():
+            fp = DIRS["tables"] / fname
+        if not fp.exists():
+            fp = DIRS["figures"] / fname
+
+        if fp.exists():
+            current_hash = md5_checksum(fp)
+            checksum_records.append({
+                "filename":    fname,
+                "stored_md5":  stored_hash,
+                "current_md5": current_hash,
+                "match":       stored_hash == current_hash,
+            })
+        else:
+            checksum_records.append({
+                "filename":   fname,
+                "stored_md5": stored_hash,
+                "current_md5": None,
+                "match":      False,
+            })
+    print(f"\nChecksum verification: {sum(r['match'] for r in checksum_records)}/{len(checksum_records)} files match")
+else:
+    print("\nBlock 10 checksums not found — skipping verification.")
+
+checksum_audit = pd.DataFrame(checksum_records) if checksum_records else pd.DataFrame(
+    columns=["filename", "stored_md5", "current_md5", "match"]
+)
+
+# ------------------------------------------------------------
+# 10. Audit decision
+# ------------------------------------------------------------
+
+file_critical_fail = n_critical_present < n_critical_total
+attr_fail          = not attribute_audit["range_pass"].fillna(False).all()
+logic_fail         = len(critical_failures) > 0
+checksum_fail      = len(checksum_audit) > 0 and not checksum_audit["match"].all()
+
+if file_critical_fail or logic_fail:
+    audit_status = "CRITICAL_FAILURES"
+elif attr_fail or checksum_fail or warnings:
+    audit_status = "WARNINGS"
+else:
+    audit_status = "PASS"
+
+issues = []
+if file_critical_fail:
+    missing = file_audit[(file_audit["criticality"] == "critical") & (~file_audit["exists"])]["output_name"].tolist()
+    issues.append(f"Missing critical files: {missing}")
+if critical_failures:
+    issues.append(f"Logic failures: {critical_failures}")
+if attr_fail:
+    failed = attribute_audit[~attribute_audit["range_pass"].fillna(False)]["resolved_column"].tolist()
+    issues.append(f"Attribute range failures: {failed}")
+if checksum_fail:
+    bad = checksum_audit[~checksum_audit["match"]]["filename"].tolist()
+    issues.append(f"Checksum mismatches: {bad}")
+if warnings:
+    issues.append(f"Warnings: {warnings}")
+
+audit_summary = pd.DataFrame([{
+    "municipality":             MUNICIPALITY,
+    "audit_status":             audit_status,
+    "n_critical_files":         n_critical_total,
+    "n_critical_present":       n_critical_present,
+    "n_supp_files":             len(SUPPLEMENTARY_FILES),
+    "n_supp_present":           n_supp_present,
+    "n_geometry_datasets":      len(geometry_audit),
+    "crs_consistent":           crs_consistent,
+    "n_attribute_checks":       len(attribute_audit),
+    "n_attribute_range_pass":   n_range_pass,
+    "n_logic_checks":           len(logic_audit),
+    "n_logic_pass":             int(logic_audit["pass"].sum()),
+    "n_checksum_verified":      len(checksum_audit),
+    "n_checksum_match":         int(checksum_audit["match"].sum()) if len(checksum_audit) > 0 else 0,
+    "issues":                   " | ".join(issues) if issues else "None",
+    "created_at":               datetime.now().isoformat(),
+}])
+
+print(f"\n{'='*50}")
+print(f"  AUDIT STATUS: {audit_status}")
+print(f"{'='*50}")
+if issues:
+    for issue in issues:
+        print(f"  {issue}")
+
+# ------------------------------------------------------------
+# 11. Export audit products
+# ------------------------------------------------------------
+
+file_audit_path      = DIRS["tables"] / "nci_br_sjc_qaqc_file_audit.csv"
+geometry_audit_path  = DIRS["tables"] / "nci_br_sjc_qaqc_geometry_audit.csv"
+attribute_audit_path = DIRS["tables"] / "nci_br_sjc_qaqc_attribute_audit.csv"
+logic_audit_path     = DIRS["tables"] / "nci_br_sjc_qaqc_logic_checks.csv"
+checksum_audit_path  = DIRS["tables"] / "nci_br_sjc_qaqc_checksum_verification.csv"
+summary_path         = DIRS["tables"] / "nci_br_sjc_qaqc_audit_summary.csv"
+
+file_audit.to_csv(file_audit_path,           index=False, encoding="utf-8-sig")
+geometry_audit.to_csv(geometry_audit_path,   index=False, encoding="utf-8-sig")
+attribute_audit.to_csv(attribute_audit_path, index=False, encoding="utf-8-sig")
+logic_audit.to_csv(logic_audit_path,         index=False, encoding="utf-8-sig")
+checksum_audit.to_csv(checksum_audit_path,   index=False, encoding="utf-8-sig")
+audit_summary.to_csv(summary_path,           index=False, encoding="utf-8-sig")
+
+print(f"\nQA/QC products exported:")
+for p in [file_audit_path, geometry_audit_path, attribute_audit_path,
+          logic_audit_path, checksum_audit_path, summary_path]:
+    print(f"  {p}")
+
+# ------------------------------------------------------------
+# 12. [FIX-6] QA/QC dashboard figure
+# ------------------------------------------------------------
+
+plt.rcParams.update({
+    "figure.dpi": 150, "savefig.dpi": CONFIG["figure_dpi"],
+    "font.family": "DejaVu Sans", "font.size": 9.5,
+    "axes.titlesize": 10, "axes.labelsize": 9,
+    "axes.linewidth": 0.7, "pdf.fonttype": 42, "ps.fonttype": 42,
+    "savefig.bbox": "tight",
+})
+
+fig = plt.figure(figsize=(16, 10), dpi=150)
+gs  = fig.add_gridspec(
+    nrows=3, ncols=3,
+    width_ratios=[1.2, 1.2, 1.0],
+    height_ratios=[1, 1, 1],
+    wspace=0.25, hspace=0.35
+)
+
+ax_a = fig.add_subplot(gs[0, 0])
+ax_b = fig.add_subplot(gs[0, 1])
+ax_c = fig.add_subplot(gs[0, 2])
+ax_d = fig.add_subplot(gs[1, 0])
+ax_e = fig.add_subplot(gs[1, 1])
+ax_f = fig.add_subplot(gs[1, 2])
+ax_g = fig.add_subplot(gs[2, 0])
+ax_h = fig.add_subplot(gs[2, 1])
+ax_i = fig.add_subplot(gs[2, 2])
+
+
+def add_panel_label(ax, label):
+    ax.text(0.02, 0.97, label, transform=ax.transAxes,
+            fontsize=12, fontweight="bold", va="top", ha="left",
+            bbox=dict(facecolor="white", edgecolor="none",
+                      alpha=0.88, boxstyle="round,pad=0.22"))
+
+# ── Panel a — File audit (critical vs supplementary) ─────────
+fa_critical = file_audit[file_audit["criticality"] == "critical"]
+fa_supp     = file_audit[file_audit["criticality"] == "supplementary"]
+for ax_sub, fa, title in [
+    (ax_a, fa_critical, "Critical files"),
+]:
+    bars = ax_sub.barh(
+        fa["output_name"],
+        fa["size_mb"].fillna(0),
+        color=fa["exists"].map({True: "#1a7a3c", False: "#b2182b"}),
+        edgecolor="white", linewidth=0.4
+    )
+    ax_sub.set_xlabel("File size (MB)")
+    ax_sub.set_title(f"{title} ({int(fa['exists'].sum())}/{len(fa)} present)", loc="left")
+    ax_sub.tick_params(axis="y", labelsize=5.5)
+    ax_sub.grid(axis="x", linewidth=0.3, alpha=0.5)
+add_panel_label(ax_a, "a")
+
+# ── Panel b — Supplementary files ────────────────────────────
+ax_b.barh(
+    fa_supp["output_name"],
+    fa_supp["size_mb"].fillna(0),
+    color=fa_supp["exists"].map({True: "#2171b5", False: "#969696"}),
+    edgecolor="white", linewidth=0.4
+)
+ax_b.set_xlabel("File size (MB)")
+ax_b.set_title(f"Supplementary files ({int(fa_supp['exists'].sum())}/{len(fa_supp)} present)", loc="left")
+ax_b.tick_params(axis="y", labelsize=6)
+ax_b.grid(axis="x", linewidth=0.3, alpha=0.5)
+add_panel_label(ax_b, "b")
+
+# ── Panel c — Audit summary scorecard ─────────────────────────
+ax_c.axis("off")
+
+score_rows = [
+    ["Critical files",    f"{n_critical_present}/{n_critical_total}",
+     "✓" if not file_critical_fail else "✗"],
+    ["Geometry check",    f"{int(geometry_audit['loaded'].sum())}/{len(geometry_audit)}",
+     "✓" if geometry_audit["loaded"].all() else "✗"],
+    ["CRS consistency",   "Yes" if crs_consistent else "No",
+     "✓" if crs_consistent else "✗"],
+    ["Attribute ranges",  f"{n_range_pass}/{len(attribute_audit)}",
+     "✓" if not attr_fail else "✗"],
+    ["Logic checks",      f"{int(logic_audit['pass'].sum())}/{len(logic_audit)}",
+     "✓" if not logic_fail else "✗"],
+    ["Checksum match",    f"{int(checksum_audit['match'].sum())}/{len(checksum_audit)}" if len(checksum_audit) > 0 else "N/A",
+     "✓" if not checksum_fail else ("✗" if len(checksum_audit) > 0 else "—")],
+    ["AUDIT STATUS",      audit_status, ""],
+]
+
+tbl = ax_c.table(
+    cellText=score_rows,
+    colLabels=["Check", "Result", "Status"],
+    loc="center", cellLoc="center"
+)
+tbl.auto_set_font_size(False)
+tbl.set_fontsize(8.0)
+tbl.scale(1.0, 1.55)
+
+status_colors = {"✓": "#e8f5e9", "✗": "#ffebee", "—": "#f5f5f5", "": "#f0f0f0"}
+for (row, col), cell in tbl.get_celld().items():
+    cell.set_edgecolor("#bdbdbd")
+    cell.set_linewidth(0.5)
+    if row == 0:
+        cell.set_facecolor("#f0f0f0")
+        cell.set_text_props(weight="bold")
+    elif row == len(score_rows):  # audit status row
+        status_color = {"PASS": "#1a7a3c", "WARNINGS": "#d95f02",
+                        "CRITICAL_FAILURES": "#b2182b"}.get(audit_status, "#969696")
+        cell.set_facecolor(status_color)
+        cell.set_text_props(weight="bold", color="white")
+    elif col == 2:
+        cell.set_facecolor(status_colors.get(score_rows[row - 1][2], "white"))
+
+ax_c.set_title("Audit scorecard", loc="left")
+add_panel_label(ax_c, "c")
+
+# ── Panel d — Geometry audit: feature counts ─────────────────
+geo_loaded = geometry_audit[geometry_audit["loaded"]]
+if len(geo_loaded) > 0:
+    ax_d.barh(geo_loaded["dataset"], geo_loaded["n_features"],
+              color="#2171b5", edgecolor="white", linewidth=0.4, alpha=0.85)
+    ax_d.set_xlabel("Number of features")
+    ax_d.set_title("Dataset feature counts", loc="left")
+    ax_d.tick_params(axis="y", labelsize=8)
+    ax_d.grid(axis="x", linewidth=0.3, alpha=0.5)
+else:
+    ax_d.axis("off")
+    ax_d.text(0.5, 0.5, "No datasets loaded", ha="center", va="center",
+              transform=ax_d.transAxes)
+add_panel_label(ax_d, "d")
+
+# ── Panel e — Attribute range checks ─────────────────────────
+n_pass = int(attribute_audit["range_pass"].sum())
+n_fail = len(attribute_audit) - n_pass
+ax_e.bar(["Pass", "Fail / N/A"], [n_pass, n_fail],
+         color=["#1a7a3c", "#b2182b"], edgecolor="white", linewidth=0.5)
+for i, v in enumerate([n_pass, n_fail]):
+    ax_e.text(i, v + 0.1, str(v), ha="center", va="bottom", fontsize=10)
+ax_e.set_ylabel("Number of attribute checks")
+ax_e.set_title(f"Attribute range check results ({n_pass}/{len(attribute_audit)} pass)", loc="left")
+ax_e.grid(axis="y", linewidth=0.3, alpha=0.5)
+add_panel_label(ax_e, "e")
+
+# ── Panel f — Logic check results ────────────────────────────
+colors_logic = logic_audit["pass"].map({True: "#1a7a3c", False: "#b2182b"}).tolist()
+ax_f.barh(logic_audit["check"], logic_audit["pass"].astype(int),
+          color=colors_logic, edgecolor="white", linewidth=0.4)
+ax_f.set_xlabel("Pass (1) / Fail (0)")
+ax_f.set_title(f"Logical consistency checks ({int(logic_audit['pass'].sum())}/{len(logic_audit)} pass)", loc="left")
+ax_f.tick_params(axis="y", labelsize=6.5)
+ax_f.grid(axis="x", linewidth=0.3, alpha=0.5)
+add_panel_label(ax_f, "f")
+
+# ── Panel g — NCI-BR distribution check ──────────────────────
+if nci_gdf is not None and "NCI_BR" in nci_gdf.columns:
+    nci_vals = pd.to_numeric(nci_gdf["NCI_BR"], errors="coerce").dropna()
+    ax_g.hist(nci_vals, bins=40, color="#1a7a3c", edgecolor="white",
+              linewidth=0.4, alpha=0.85)
+    ax_g.axvline(float(nci_vals.mean()),   color="black",   linewidth=1.2,
+                 linestyle="--", label=f"Mean = {nci_vals.mean():.1f}")
+    ax_g.axvline(float(nci_vals.median()), color="#d62728", linewidth=1.0,
+                 linestyle=":",  label=f"Median = {nci_vals.median():.1f}")
+    ax_g.set_xlabel("NCI-BR (0–100)")
+    ax_g.set_ylabel("Cell count")
+    ax_g.set_title("NCI-BR distribution (QA: should span 0–100)", loc="left")
+    ax_g.legend(fontsize=7.5, framealpha=0.85)
+    ax_g.grid(True, linewidth=0.3, alpha=0.5)
+else:
+    ax_g.axis("off")
+    ax_g.text(0.5, 0.5, "NCI-BR not available", ha="center",
+              va="center", transform=ax_g.transAxes)
+add_panel_label(ax_g, "g")
+
+# ── Panel h — Checksum verification ──────────────────────────
+if len(checksum_audit) > 0:
+    colors_cs = checksum_audit["match"].map({True: "#1a7a3c", False: "#b2182b"}).tolist()
+    ax_h.barh(checksum_audit["filename"],
+              checksum_audit["match"].astype(int),
+              color=colors_cs, edgecolor="white", linewidth=0.4)
+    ax_h.set_xlabel("Match (1) / Mismatch (0)")
+    ax_h.set_title(f"Block 10 checksum verification ({int(checksum_audit['match'].sum())}/{len(checksum_audit)})", loc="left")
+    ax_h.tick_params(axis="y", labelsize=7)
+    ax_h.grid(axis="x", linewidth=0.3, alpha=0.5)
+else:
+    ax_h.axis("off")
+    ax_h.text(0.5, 0.5, "No checksums to verify\n(run Block 10 first)",
+              ha="center", va="center", transform=ax_h.transAxes)
+add_panel_label(ax_h, "h")
+
+# ── Panel i — Reproducibility info table ─────────────────────
+ax_i.axis("off")
+
+repro_rows = [
+    ["Municipality",     MUNICIPALITY],
+    ["Target year",      str(TARGET_YEAR)],
+    ["Analysis period",  f"{START_YEAR}–{TARGET_YEAR}"],
+    ["Audit status",     audit_status],
+    ["Critical files",   f"{n_critical_present}/{n_critical_total}"],
+    ["Logic checks",     f"{int(logic_audit['pass'].sum())}/{len(logic_audit)}"],
+    ["Checksums OK",     f"{int(checksum_audit['match'].sum())}/{len(checksum_audit)}" if len(checksum_audit) > 0 else "N/A"],
+    ["Audit date",       datetime.now().strftime("%Y-%m-%d %H:%M")],
+]
+
+tbl2 = ax_i.table(
+    cellText=repro_rows,
+    colLabels=["Parameter", "Value"],
+    loc="center", cellLoc="center"
+)
+tbl2.auto_set_font_size(False)
+tbl2.set_fontsize(8.0)
+tbl2.scale(1.0, 1.58)
+for (row, col), cell in tbl2.get_celld().items():
+    cell.set_edgecolor("#bdbdbd")
+    cell.set_linewidth(0.5)
+    if row == 0:
+        cell.set_facecolor("#2171b5")
+        cell.set_text_props(weight="bold", color="white")
+    elif row % 2 == 0:
+        cell.set_facecolor("#f0f7ff")
+ax_i.set_title("Reproducibility parameters", loc="left")
+add_panel_label(ax_i, "i")
+
+status_title_color = {"PASS": "#1a7a3c", "WARNINGS": "#d95f02",
+                      "CRITICAL_FAILURES": "#b2182b"}.get(audit_status, "black")
+
+fig.suptitle(
+    f"QA/QC and reproducibility audit — NCI-BR | {MUNICIPALITY}, SP  "
+    f"[STATUS: {audit_status}]",
+    fontsize=13, fontweight="bold", y=0.995,
+    color=status_title_color
+)
+fig.text(
+    0.02, 0.005,
+    "Block 11 audits file presence, geometry validity, attribute ranges, "
+    "logical consistency, and MD5 checksums. No new data generated.",
+    fontsize=7.5, color="#4d4d4d"
+)
+
+fig_png = DIRS["figures"] / "figure_10_nci_br_sjc_qaqc_dashboard.png"
+fig_pdf = DIRS["figures"] / "figure_10_nci_br_sjc_qaqc_dashboard.pdf"
+
+plt.savefig(fig_png, dpi=CONFIG["figure_dpi"], bbox_inches="tight")
+plt.savefig(fig_pdf, dpi=CONFIG["figure_dpi"], bbox_inches="tight")
+plt.show()
+
+print(f"\nQA/QC dashboard exported:\n  {fig_png}\n  {fig_pdf}")
+logger.info(f"QA/QC dashboard: {fig_png}")
+
+# ------------------------------------------------------------
+# 13. [NEW-1] Reproducibility report JSON
+# ------------------------------------------------------------
+
+repro_report = {
+    "project":          "NCI-BR",
+    "municipality":     MUNICIPALITY,
+    "audit_status":     audit_status,
+    "audit_date":       datetime.now().isoformat(),
+    "target_year":      TARGET_YEAR,
+    "analysis_period":  [START_YEAR, TARGET_YEAR],
+    "file_audit": {
+        "critical_present":  n_critical_present,
+        "critical_total":    n_critical_total,
+        "supplementary_present": n_supp_present,
+        "supplementary_total":   len(SUPPLEMENTARY_FILES),
+    },
+    "geometry_audit": {
+        d["dataset"]: {
+            "loaded":    d["loaded"],
+            "n_features":d["n_features"],
+            "crs":       d["crs"],
+        }
+        for d in geometry_records
+    },
+    "crs_consistent":    crs_consistent,
+    "attribute_range_pass": f"{n_range_pass}/{len(attribute_audit)}",
+    "logic_checks_pass": f"{int(logic_audit['pass'].sum())}/{len(logic_audit)}",
+    "checksum_match":    f"{int(checksum_audit['match'].sum())}/{len(checksum_audit)}" if len(checksum_audit) > 0 else "not_run",
+    "issues":            issues if issues else [],
+    "outputs": {
+        "file_audit_csv":       str(file_audit_path),
+        "geometry_audit_csv":   str(geometry_audit_path),
+        "attribute_audit_csv":  str(attribute_audit_path),
+        "logic_audit_csv":      str(logic_audit_path),
+        "checksum_audit_csv":   str(checksum_audit_path),
+        "audit_summary_csv":    str(summary_path),
+        "dashboard_png":        str(fig_png),
+        "dashboard_pdf":        str(fig_pdf),
+    },
+}
+
+repro_path = DIRS["metadata"] / "nci_br_sjc_reproducibility_report.json"
+with open(repro_path, "w", encoding="utf-8") as f:
+    json.dump(repro_report, f, indent=4, ensure_ascii=False)
+print(f"Reproducibility report: {repro_path}")
+
+# Block metadata
+block11_metadata = {
+    "block":        "11",
+    "version":      "final",
+    "municipality": MUNICIPALITY,
+    "audit_status": audit_status,
+    "outputs": {
+        "file_audit_csv":     str(file_audit_path),
+        "geometry_audit_csv": str(geometry_audit_path),
+        "attr_audit_csv":     str(attribute_audit_path),
+        "logic_audit_csv":    str(logic_audit_path),
+        "checksum_audit_csv": str(checksum_audit_path),
+        "summary_csv":        str(summary_path),
+        "dashboard_png":      str(fig_png),
+        "dashboard_pdf":      str(fig_pdf),
+        "repro_report_json":  str(repro_path),
+    },
+    "created_at": datetime.now().isoformat(),
+}
+
+metadata_path = DIRS["metadata"] / "nci_br_block11_metadata.json"
+with open(metadata_path, "w", encoding="utf-8") as f:
+    json.dump(block11_metadata, f, indent=4, ensure_ascii=False)
+print(f"Metadata saved: {metadata_path}")
+logger.info(f"Block 11 completed — status: {audit_status}")
+
+# ------------------------------------------------------------
+# 14. Final summary
+# ------------------------------------------------------------
+
+print("\n" + "=" * 62)
+print(f"BLOCK 11 — QA/QC COMPLETED | {MUNICIPALITY}")
+print(f"  AUDIT STATUS: {audit_status}")
+print("=" * 62)
+print(f"  Critical files      : {n_critical_present}/{n_critical_total}")
+print(f"  Geometry check      : {int(geometry_audit['loaded'].sum())}/{len(geometry_audit)} loaded")
+print(f"  CRS consistent      : {crs_consistent}")
+print(f"  Attribute ranges    : {n_range_pass}/{len(attribute_audit)} passed")
+print(f"  Logic checks        : {int(logic_audit['pass'].sum())}/{len(logic_audit)} passed")
+cs_str = f"{int(checksum_audit['match'].sum())}/{len(checksum_audit)}" if len(checksum_audit) > 0 else "N/A"
+print(f"  Checksums verified  : {cs_str}")
+if issues:
+    print(f"\n  Issues:")
+    for issue in issues:
+        print(f"    {issue}")
+print("=" * 62)
+print("\nThis block only audited existing outputs — no new data generated.")
