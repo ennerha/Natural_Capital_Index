@@ -1,0 +1,703 @@
+# ============================================================
+# BRAZIL NCI-BR PROJECT
+# BLOCK 12 — SPATIAL REGRESSION OF OBSERVED URBAN CONVERSION
+# REAL DATA ONLY — NO SYNTHETIC FOOTPRINTS
+# FOCUS: SÃO JOSÉ DOS CAMPOS — SP, BRAZIL
+# ============================================================
+#
+# Boundary pattern: identical to Block 03 section 4.
+#   muni_path = DIRS["processed"] / "nci_br_sjc_municipality.gpkg"
+#   muni_gdf  = gpd.read_file(muni_path)
+#   muni_plot = muni_gdf.to_crs(plot_crs)
+#   map_extent from muni_plot.total_bounds
+# If nci_br_sjc_municipality.gpkg does not exist, it is downloaded
+# from the IBGE API and saved — same as corrected Block 02 does.
+# ============================================================
+
+import io
+import sys
+import json
+import logging
+import hashlib
+import requests
+import subprocess
+from pathlib import Path
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+from matplotlib.colors import TwoSlopeNorm
+
+# ------------------------------------------------------------
+# 1. Install / verify required packages
+# ------------------------------------------------------------
+
+REQUIRED_PACKAGES = ["libpysal", "esda", "spreg", "statsmodels", "scikit-learn"]
+
+def install_if_missing(pkg):
+    try:
+        __import__(pkg)
+    except ImportError:
+        print(f"Installing {pkg}...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
+
+for pkg in REQUIRED_PACKAGES:
+    install_if_missing(pkg)
+
+import statsmodels.api as sm
+from sklearn.preprocessing import StandardScaler
+from libpysal.weights import Queen, KNN
+from libpysal.weights.spatial_lag import lag_spatial
+from esda.moran import Moran
+from spreg import OLS, ML_Lag, ML_Error
+
+# ------------------------------------------------------------
+# 2. Reload project configuration
+# ------------------------------------------------------------
+
+PROJECT_ROOT = Path("/content/drive/MyDrive/Brazil/NCI_BR_Project")
+
+DIRS = {
+    "root":         PROJECT_ROOT,
+    "raw":          PROJECT_ROOT / "01_raw",
+    "intermediate": PROJECT_ROOT / "02_intermediate",
+    "processed":    PROJECT_ROOT / "03_processed",
+    "tables":       PROJECT_ROOT / "04_tables",
+    "figures":      PROJECT_ROOT / "05_figures",
+    "maps":         PROJECT_ROOT / "06_maps",
+    "exports":      PROJECT_ROOT / "07_exports",
+    "logs":         PROJECT_ROOT / "08_logs",
+    "metadata":     PROJECT_ROOT / "09_metadata",
+}
+for d in DIRS.values():
+    d.mkdir(parents=True, exist_ok=True)
+
+config_path = DIRS["metadata"] / "nci_br_config.json"
+with open(config_path, "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
+
+plot_crs     = CONFIG.get("output_crs", "EPSG:5880")
+MUNICIPALITY = "São José dos Campos"
+TARGET_YEAR  = int(CONFIG["baseline_year"])
+REF_YEAR     = 1985
+
+# ------------------------------------------------------------
+# 3. Logging
+# ------------------------------------------------------------
+
+log_file = DIRS["logs"] / f"nci_br_block12_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+logging.basicConfig(
+    filename=log_file, level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger("NCI_BR_BLOCK12")
+logger.info(f"Block 12 started — {MUNICIPALITY}.")
+print(f"Log file: {log_file}")
+
+# ------------------------------------------------------------
+# 4. Load municipality boundary — EXACT SAME PATTERN AS BLOCK 03
+#
+#    Block 03 section 4:
+#        muni_path = DIRS["processed"] / "nci_br_sjc_municipality.gpkg"
+#        muni_gdf  = gpd.read_file(muni_path)
+#        if muni_gdf.crs is None:
+#            muni_gdf = muni_gdf.set_crs("EPSG:4674")
+#        muni_plot = muni_gdf.to_crs(plot_crs)
+#
+#    The only addition here: if the file does not exist yet
+#    (because Block 02 was run in its original version), download
+#    the real SJC polygon from the IBGE API and save it so that
+#    Block 03 and all subsequent blocks can use it.
+# ------------------------------------------------------------
+
+muni_path = DIRS["processed"] / "nci_br_sjc_municipality.gpkg"
+
+if not muni_path.exists():
+    print("nci_br_sjc_municipality.gpkg not found.")
+    print("Downloading real SJC boundary from IBGE API (code 3549904)...")
+    url = ("https://servicodados.ibge.gov.br/api/v3/malhas/municipios"
+           "/3549904?formato=application/json&qualidade=maxima")
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    muni_gdf = gpd.read_file(io.BytesIO(resp.content))
+    muni_gdf = muni_gdf.set_crs("EPSG:4326").to_crs("EPSG:4674")
+    muni_gdf["NM_MUN"]   = MUNICIPALITY
+    muni_gdf["CD_MUN"]   = "3549904"
+    muni_gdf["SIGLA_UF"] = "SP"
+    muni_gdf.to_file(muni_path, driver="GPKG")
+    print(f"  Saved to: {muni_path.name}")
+else:
+    muni_gdf = gpd.read_file(muni_path)
+    print(f"Municipal boundary loaded: {muni_path.name}")
+
+# From here: identical to Block 03
+if muni_gdf.crs is None:
+    muni_gdf = muni_gdf.set_crs("EPSG:4674")
+
+muni_plot = muni_gdf.to_crs(plot_crs)
+
+xmin, ymin, xmax, ymax = muni_plot.total_bounds
+xbuf = (xmax - xmin) * 0.05
+ybuf = (ymax - ymin) * 0.05
+map_extent = [xmin - xbuf, xmax + xbuf, ymin - ybuf, ymax + ybuf]
+
+print(f"Municipality : {MUNICIPALITY}")
+print(f"Map extent   : {xmin:.0f}, {ymin:.0f} → {xmax:.0f}, {ymax:.0f} (EPSG:5880)")
+
+# ------------------------------------------------------------
+# 5. Load regression input data and clip to real SJC polygon
+# ------------------------------------------------------------
+
+CANDIDATE_INPUTS = [
+    DIRS["processed"] / "nci_br_sjc_evidence_synthesis.gpkg",
+    DIRS["processed"] / "nci_br_sjc_observed_conversion.gpkg",
+    DIRS["processed"] / "nci_br_real_data_evidence_synthesis_map.gpkg",
+    DIRS["processed"] / "nci_br_observed_urban_conversion_accounting.gpkg",
+]
+
+input_path = next((p for p in CANDIDATE_INPUTS if p.exists()), None)
+if input_path is None:
+    raise FileNotFoundError(
+        "No observed conversion dataset found. Tried:\n" +
+        "\n".join(f"  {p}" for p in CANDIDATE_INPUTS)
+    )
+print(f"\nUsing input: {input_path.name}")
+
+gdf = gpd.read_file(input_path)
+if gdf.crs is None:
+    gdf = gdf.set_crs(plot_crs)
+gdf = gdf.to_crs(plot_crs)
+
+# Clip to real SJC polygon — same way Block 03 clips GEE outputs to aoi_geom
+n_before = len(gdf)
+gdf = gpd.clip(gdf, muni_plot).copy().reset_index(drop=True)
+print(f"Clip to SJC  : {n_before} → {len(gdf)} cells "
+      f"({n_before - len(gdf)} outside SJC removed)")
+
+# ------------------------------------------------------------
+# 6. Detect response and predictor columns
+# ------------------------------------------------------------
+
+def find_column(df, candidates, required=True):
+    for c in candidates:
+        if c in df.columns:
+            return c
+    if required:
+        raise ValueError(f"None of the candidate columns found: {candidates}")
+    return None
+
+response_col = find_column(gdf, [
+    f"new_urban_{REF_YEAR}_{TARGET_YEAR}_ha",
+    f"observed_new_urban_{REF_YEAR}_{TARGET_YEAR}_ha",
+])
+native_col = find_column(gdf, [
+    f"native_to_urban_{REF_YEAR}_{TARGET_YEAR}_ha",
+], required=False)
+
+gdf[response_col] = pd.to_numeric(gdf[response_col], errors="coerce").fillna(0)
+if native_col:
+    gdf[native_col] = pd.to_numeric(gdf[native_col], errors="coerce").fillna(0)
+
+gdf["y_obs_urban_ha"] = gdf[response_col]
+gdf["y_log1p_urban"]  = np.log1p(gdf["y_obs_urban_ha"])
+
+CANDIDATE_PREDICTORS = [
+    "NCI_BR",
+    "score_native_vegetation",
+    "score_vegetation_condition",
+    "score_hydrological_regulation",
+    "score_low_anthropic_pressure",
+    "score_floodplain_function",
+    "score_vegetation_trend",
+]
+
+available_predictors = [c for c in CANDIDATE_PREDICTORS if c in gdf.columns]
+
+# If NCI scores are missing, merge from Block 06
+if len(available_predictors) < 3:
+    nci_fb_paths = [
+        DIRS["processed"] / "nci_br_sjc_grid_integrated_index.gpkg",
+        DIRS["processed"] / "nci_br_grid_integrated_index.gpkg",
+        DIRS["processed"] / "nci_br_sjc_spatial_statistics.gpkg",
+        DIRS["processed"] / "nci_br_spatial_statistics_lisa_hotspots.gpkg",
+    ]
+    nci_fb = next((p for p in nci_fb_paths if p.exists()), None)
+    if nci_fb:
+        print(f"  Merging NCI scores from: {nci_fb.name}")
+        nci_merge = gpd.read_file(nci_fb)
+        score_cols = [c for c in CANDIDATE_PREDICTORS if c in nci_merge.columns]
+        if "grid_id" in nci_merge.columns and score_cols:
+            if "grid_id" not in gdf.columns:
+                gdf["grid_id"] = gdf.index.astype(int)
+            gdf = gdf.merge(
+                pd.DataFrame(nci_merge[["grid_id"] + score_cols]),
+                on="grid_id", how="left", suffixes=("", "_nci")
+            )
+            available_predictors = [c for c in CANDIDATE_PREDICTORS if c in gdf.columns]
+            print(f"  After merge: {len(available_predictors)} predictors available")
+
+if len(available_predictors) < 3:
+    raise ValueError(
+        f"Too few predictors ({len(available_predictors)}): {available_predictors}\n"
+        "Run Block 06 first."
+    )
+
+for col in available_predictors:
+    gdf[col] = pd.to_numeric(gdf[col], errors="coerce")
+
+model_gdf = gdf.dropna(
+    subset=["y_log1p_urban"] + available_predictors
+).reset_index(drop=True).copy()
+
+# Project to plot_crs for mapping — same as Block 03's grid_lulc_plot
+model_plot = model_gdf.to_crs(plot_crs) if model_gdf.crs != plot_crs else model_gdf.copy()
+
+print(f"\nValid cells for regression : {len(model_gdf)}")
+print(f"Response column           : {response_col}")
+print(f"Predictors ({len(available_predictors)})           : {available_predictors}")
+
+# ------------------------------------------------------------
+# 7. Spatial weights
+# ------------------------------------------------------------
+
+def build_weights(gdf):
+    try:
+        w = Queen.from_dataframe(gdf)
+        if len(w.islands) > 0:
+            w = KNN.from_dataframe(gdf, k=8)
+            wtype = "KNN-8"
+        else:
+            wtype = "Queen contiguity"
+    except Exception as e:
+        print(f"  Queen failed ({e}). Using KNN-8.")
+        w = KNN.from_dataframe(gdf, k=8)
+        wtype = "KNN-8"
+    w.transform = "r"
+    return w, wtype
+
+w, weights_type = build_weights(model_gdf)
+print(f"Spatial weights: {weights_type}")
+
+# ------------------------------------------------------------
+# 8. Standardize predictors and fit OLS
+# ------------------------------------------------------------
+
+X_raw    = model_gdf[available_predictors].copy()
+scaler   = StandardScaler()
+X_scaled = scaler.fit_transform(X_raw)
+z_names  = [f"z_{c}" for c in available_predictors]
+X_scaled_df = pd.DataFrame(X_scaled, columns=z_names, index=model_gdf.index)
+for col in z_names:
+    model_gdf[col] = X_scaled_df[col]
+
+X_sm   = sm.add_constant(X_scaled_df)
+ols_sm = sm.OLS(model_gdf["y_log1p_urban"], X_sm).fit(cov_type="HC3")
+
+model_gdf["OLS_resid"]     = ols_sm.resid
+model_gdf["OLS_predicted"] = ols_sm.predict(X_sm)
+model_gdf["OLS_pred_ha"]   = np.expm1(model_gdf["OLS_predicted"]).clip(lower=0)
+model_gdf["OLS_resid_lag"] = lag_spatial(w, model_gdf["OLS_resid"].values)
+
+resid_moran = Moran(model_gdf["OLS_resid"].values, w, permutations=999)
+print(f"\nOLS R²           : {ols_sm.rsquared:.4f}")
+print(f"OLS AIC          : {ols_sm.aic:.2f}")
+print(f"Resid. Moran I   : {resid_moran.I:.4f} (p = {resid_moran.p_sim:.4f})")
+
+# ------------------------------------------------------------
+# 9. Spatial regression models
+# ------------------------------------------------------------
+
+Y = model_gdf["y_log1p_urban"].values.reshape(-1, 1)
+X = model_gdf[z_names].values
+
+def safe_get(obj, attr, idx=None, default=np.nan):
+    val = getattr(obj, attr, None)
+    if val is None: return default
+    try: return float(val[idx]) if idx is not None else float(val)
+    except: return default
+
+sp_ols = OLS(Y, X, w=w, name_y="log1p_urban_ha", name_x=z_names,
+             name_w=weights_type, spat_diag=True, moran=True)
+
+lag_model, lag_ok = None, False
+try:
+    lag_model = ML_Lag(Y, X, w=w, name_y="log1p_urban_ha",
+                       name_x=z_names, name_w=weights_type, method="ord")
+    lag_ok = True
+    model_gdf["Lag_predicted"] = lag_model.predy.flatten()
+    model_gdf["Lag_pred_ha"]   = np.expm1(model_gdf["Lag_predicted"]).clip(lower=0)
+    print(f"Spatial Lag AIC  : {lag_model.aic:.2f}")
+except Exception as e:
+    print(f"Spatial lag failed: {e}")
+
+error_model, error_ok = None, False
+try:
+    error_model = ML_Error(Y, X, w=w, name_y="log1p_urban_ha",
+                           name_x=z_names, name_w=weights_type, method="ord")
+    error_ok = True
+    print(f"Spatial Error AIC: {error_model.aic:.2f}")
+except Exception as e:
+    print(f"Spatial error failed: {e}")
+
+# ------------------------------------------------------------
+# 10. Model comparison and coefficient tables
+# ------------------------------------------------------------
+
+model_records = [
+    {"model": "OLS HC3", "n": int(ols_sm.nobs),
+     "r2": round(ols_sm.rsquared, 4), "aic": round(ols_sm.aic, 2),
+     "resid_moran_I": round(resid_moran.I, 4),
+     "resid_moran_p": round(resid_moran.p_sim, 4)},
+]
+if lag_ok:
+    model_records.append({
+        "model": "Spatial Lag ML", "n": lag_model.n,
+        "r2": round(safe_get(lag_model, "pr2"), 4),
+        "aic": round(lag_model.aic, 2),
+        "resid_moran_I": np.nan, "resid_moran_p": np.nan})
+if error_ok:
+    model_records.append({
+        "model": "Spatial Error ML", "n": error_model.n,
+        "r2": round(safe_get(error_model, "pr2"), 4),
+        "aic": round(error_model.aic, 2),
+        "resid_moran_I": np.nan, "resid_moran_p": np.nan})
+
+model_comparison = pd.DataFrame(model_records)
+best_aic = model_comparison.loc[model_comparison["aic"].idxmin(), "model"]
+print(f"Best AIC model   : {best_aic}")
+
+ols_coef_df = pd.DataFrame({
+    "model":    "OLS_HC3",
+    "variable": ols_sm.params.index,
+    "coef":     ols_sm.params.values,
+    "std_err":  ols_sm.bse.values,
+    "t_stat":   ols_sm.tvalues.values,
+    "p_value":  ols_sm.pvalues.values,
+})
+
+interp_records = []
+for pred, zname in zip(available_predictors, z_names):
+    row = ols_coef_df[ols_coef_df["variable"] == zname]
+    if len(row) == 0: continue
+    coef = float(row["coef"].iloc[0])
+    pval = float(row["p_value"].iloc[0])
+    interp_records.append({
+        "predictor":    pred,
+        "std_coef_OLS": round(coef, 4),
+        "p_value":      round(pval, 4),
+        "direction":    "positive" if coef > 0 else "negative",
+        "significance": ("significant"    if pval <= 0.05 else
+                         "marginal"        if pval <= 0.10 else
+                         "not significant"),
+    })
+interpretation_df = pd.DataFrame(interp_records)
+
+# ------------------------------------------------------------
+# 11. Export products
+# ------------------------------------------------------------
+
+reg_gpkg_path = DIRS["processed"] / "nci_br_sjc_spatial_regression.gpkg"
+comp_path     = DIRS["tables"]    / "nci_br_sjc_spatial_regression_model_comparison.csv"
+coef_path     = DIRS["tables"]    / "nci_br_sjc_spatial_regression_coefficients.csv"
+interp_path   = DIRS["tables"]    / "nci_br_sjc_spatial_regression_interpretation.csv"
+
+model_gdf.to_file(reg_gpkg_path, layer="spatial_regression", driver="GPKG")
+model_comparison.to_csv(comp_path,        index=False, encoding="utf-8-sig")
+ols_coef_df.to_csv(coef_path,             index=False, encoding="utf-8-sig")
+interpretation_df.to_csv(interp_path,     index=False, encoding="utf-8-sig")
+
+print(f"\nOutputs exported:")
+for p in [reg_gpkg_path, comp_path, coef_path, interp_path]:
+    print(f"  {p}")
+logger.info(f"Outputs exported. n={len(model_gdf)} | weights={weights_type}")
+
+# ------------------------------------------------------------
+# 12. Cartographic helpers — IDENTICAL to Block 03
+# ------------------------------------------------------------
+
+def add_panel_label(ax, label):
+    ax.text(0.02, 0.97, label, transform=ax.transAxes,
+            fontsize=12, fontweight="bold", va="top", ha="left",
+            bbox=dict(facecolor="white", edgecolor="none",
+                      alpha=0.88, boxstyle="round,pad=0.22"))
+
+def overlay_boundary(ax, gdf):
+    """Overlay municipal boundary on any map panel."""
+    gdf.boundary.plot(ax=ax, edgecolor="black", linewidth=1.2, zorder=5)
+
+# Update model_plot after model_gdf was finalized
+model_plot = model_gdf.to_crs(plot_crs)
+
+# ------------------------------------------------------------
+# 13. Figure — 9 panels using Block 03 map pattern exactly
+# ------------------------------------------------------------
+
+plt.rcParams.update({
+    "figure.dpi": 150, "savefig.dpi": CONFIG["figure_dpi"],
+    "font.family": "DejaVu Sans", "font.size": 9.5,
+    "axes.titlesize": 10, "axes.labelsize": 9,
+    "legend.fontsize": 8.5, "axes.linewidth": 0.7,
+    "pdf.fonttype": 42, "ps.fonttype": 42, "savefig.bbox": "tight",
+})
+
+fig = plt.figure(figsize=(16, 11), dpi=150)
+gs  = fig.add_gridspec(
+    nrows=3, ncols=3,
+    width_ratios=[1.2, 1.2, 1.0],
+    height_ratios=[1, 1, 1],
+    wspace=0.22, hspace=0.32
+)
+ax_a = fig.add_subplot(gs[0, 0])
+ax_b = fig.add_subplot(gs[0, 1])
+ax_c = fig.add_subplot(gs[0, 2])
+ax_d = fig.add_subplot(gs[1, 0])
+ax_e = fig.add_subplot(gs[1, 1])
+ax_f = fig.add_subplot(gs[1, 2])
+ax_g = fig.add_subplot(gs[2, 0])
+ax_h = fig.add_subplot(gs[2, 1])
+ax_i = fig.add_subplot(gs[2, 2])
+
+# ── Panel a — Observed conversion map ────────────────────────
+model_plot.plot(
+    column="y_obs_urban_ha", ax=ax_a,
+    cmap="Reds", linewidth=0.0, legend=True,
+    legend_kwds={"label": "Observed new urban (ha)", "shrink": 0.7},
+    missing_kwds={"color": "lightgrey"}
+)
+overlay_boundary(ax_a, muni_plot)
+ax_a.set_xlim(map_extent[0], map_extent[1])
+ax_a.set_ylim(map_extent[2], map_extent[3])
+ax_a.set_title(f"Observed conversion {REF_YEAR}–{TARGET_YEAR}", loc="left")
+ax_a.set_axis_off()
+add_panel_label(ax_a, "a")
+
+# ── Panel b — OLS predicted map ───────────────────────────────
+model_plot.plot(
+    column="OLS_pred_ha", ax=ax_b,
+    cmap="Reds", linewidth=0.0, legend=True,
+    legend_kwds={"label": "OLS-predicted (ha)", "shrink": 0.7},
+    missing_kwds={"color": "lightgrey"}
+)
+overlay_boundary(ax_b, muni_plot)
+ax_b.set_xlim(map_extent[0], map_extent[1])
+ax_b.set_ylim(map_extent[2], map_extent[3])
+ax_b.set_title("OLS-predicted conversion (back-transformed)", loc="left")
+ax_b.set_axis_off()
+add_panel_label(ax_b, "b")
+
+# ── Panel c — Model comparison table ─────────────────────────
+ax_c.axis("off")
+mc_disp = model_comparison.copy()
+for col in ["r2", "aic", "resid_moran_I", "resid_moran_p"]:
+    mc_disp[col] = mc_disp[col].map(lambda x: f"{x:.3f}" if pd.notna(x) else "—")
+tbl = ax_c.table(
+    cellText=mc_disp[["model", "r2", "aic", "resid_moran_I", "resid_moran_p"]].values,
+    colLabels=["Model", "R²", "AIC", "Moran I (res)", "p"],
+    loc="center", cellLoc="center"
+)
+tbl.auto_set_font_size(False); tbl.set_fontsize(6.8); tbl.scale(1.0, 1.35)
+for (row, col), cell in tbl.get_celld().items():
+    cell.set_edgecolor("#bdbdbd"); cell.set_linewidth(0.5)
+    if row == 0:
+        cell.set_facecolor("#f0f0f0"); cell.set_text_props(weight="bold")
+ax_c.set_title("Model comparison (lower AIC = better)", loc="left")
+add_panel_label(ax_c, "c")
+
+# ── Panel d — OLS residual map ────────────────────────────────
+resid_vals = model_plot["OLS_resid"].dropna()
+if len(resid_vals) > 0:
+    vmax_abs = max(abs(float(resid_vals.quantile(0.02))),
+                   abs(float(resid_vals.quantile(0.98))), 0.01)
+    norm_div = TwoSlopeNorm(vmin=-vmax_abs, vcenter=0, vmax=vmax_abs)
+    model_plot.plot(
+        column="OLS_resid", ax=ax_d,
+        cmap="RdBu_r", norm=norm_div, linewidth=0.0, legend=True,
+        legend_kwds={"label": "OLS residual", "shrink": 0.7},
+        missing_kwds={"color": "lightgrey"}
+    )
+overlay_boundary(ax_d, muni_plot)
+ax_d.set_xlim(map_extent[0], map_extent[1])
+ax_d.set_ylim(map_extent[2], map_extent[3])
+ax_d.set_title(
+    f"OLS residuals (Moran I = {resid_moran.I:.3f}, p = {resid_moran.p_sim:.3f})",
+    loc="left"
+)
+ax_d.set_axis_off()
+add_panel_label(ax_d, "d")
+
+# ── Panel e — Standardised OLS coefficients ──────────────────
+coef_plot = ols_coef_df[ols_coef_df["variable"].isin(z_names)].copy()
+coef_plot["label"] = (coef_plot["variable"]
+                      .str.replace("z_score_", "", regex=False)
+                      .str.replace("z_", "", regex=False)
+                      .str.replace("_", " ").str[:22])
+coef_plot["sig"]   = coef_plot["p_value"] <= 0.05
+coef_plot = coef_plot.sort_values("coef")
+colors_e  = ["#1a7a3c" if s else "#969696" for s in coef_plot["sig"]]
+ax_e.barh(coef_plot["label"], coef_plot["coef"],
+          color=colors_e, edgecolor="white", linewidth=0.4)
+ax_e.axvline(0, color="black", linewidth=0.8)
+ax_e.set_xlabel("Standardised OLS coefficient")
+ax_e.set_title("OLS coefficients (green = p ≤ 0.05)", loc="left")
+ax_e.tick_params(axis="y", labelsize=7.5)
+ax_e.grid(axis="x", linewidth=0.3, alpha=0.5)
+add_panel_label(ax_e, "e")
+
+# ── Panel f — Interpretation table ───────────────────────────
+ax_f.axis("off")
+int_disp = interpretation_df.copy()
+int_disp["predictor"]   = int_disp["predictor"].str.replace("score_", "", regex=False)
+int_disp["std_coef_OLS"]= int_disp["std_coef_OLS"].map(lambda x: f"{x:.3f}")
+int_disp["p_value"]     = int_disp["p_value"].map(lambda x: f"{x:.3f}")
+tbl2 = ax_f.table(
+    cellText=int_disp[["predictor", "std_coef_OLS", "p_value", "significance"]].values,
+    colLabels=["Predictor", "β (std)", "p", "Significance"],
+    loc="center", cellLoc="center"
+)
+tbl2.auto_set_font_size(False); tbl2.set_fontsize(6.5); tbl2.scale(1.0, 1.35)
+for (row, col), cell in tbl2.get_celld().items():
+    cell.set_edgecolor("#bdbdbd"); cell.set_linewidth(0.5)
+    if row == 0:
+        cell.set_facecolor("#f0f0f0"); cell.set_text_props(weight="bold")
+    elif row > 0 and col == 3:
+        sig_val = int_disp.iloc[row - 1]["significance"]
+        cell.set_facecolor("#e8f5e9" if sig_val == "significant" else
+                           "#fff9e6" if sig_val == "marginal" else "#fafafa")
+ax_f.set_title("Conversion driver interpretation (OLS-HC3)", loc="left")
+add_panel_label(ax_f, "f")
+
+# ── Panel g — Observed vs predicted scatter ───────────────────
+ax_g.scatter(model_gdf["y_log1p_urban"], model_gdf["OLS_predicted"],
+             s=8, alpha=0.45, color="#2171b5")
+lims = [min(model_gdf["y_log1p_urban"].min(), model_gdf["OLS_predicted"].min()),
+        max(model_gdf["y_log1p_urban"].max(), model_gdf["OLS_predicted"].max())]
+ax_g.plot(lims, lims, "k--", linewidth=0.8, label="1:1 line")
+ax_g.set_xlabel("Observed log(1 + conversion ha)")
+ax_g.set_ylabel("OLS predicted")
+ax_g.set_title(f"Observed vs predicted (R² = {ols_sm.rsquared:.3f})", loc="left")
+ax_g.legend(fontsize=7.5)
+ax_g.grid(True, linewidth=0.3, alpha=0.5)
+add_panel_label(ax_g, "g")
+
+# ── Panel h — Moran scatterplot of residuals ──────────────────
+ax_h.scatter(model_gdf["OLS_resid"], model_gdf["OLS_resid_lag"],
+             s=8, alpha=0.45, color="#d62728")
+coef_h = np.polyfit(model_gdf["OLS_resid"], model_gdf["OLS_resid_lag"], 1)
+xl = np.linspace(model_gdf["OLS_resid"].min(), model_gdf["OLS_resid"].max(), 100)
+ax_h.plot(xl, coef_h[0] * xl + coef_h[1], "k-", linewidth=1.5)
+ax_h.axhline(0, color="gray", linewidth=0.5)
+ax_h.axvline(0, color="gray", linewidth=0.5)
+ax_h.set_xlabel("OLS residual")
+ax_h.set_ylabel("Spatial lag of OLS residual")
+ax_h.set_title(
+    f"Moran scatterplot of residuals (I = {resid_moran.I:.3f})", loc="left"
+)
+ax_h.grid(True, linewidth=0.3, alpha=0.5)
+add_panel_label(ax_h, "h")
+
+# ── Panel i — Spatial Lag predicted map (if available) ────────
+if lag_ok and "Lag_pred_ha" in model_plot.columns:
+    model_plot.plot(
+        column="Lag_pred_ha", ax=ax_i,
+        cmap="Reds", linewidth=0.0, legend=True,
+        legend_kwds={"label": "Spatial lag predicted (ha)", "shrink": 0.7},
+        missing_kwds={"color": "lightgrey"}
+    )
+    overlay_boundary(ax_i, muni_plot)
+    ax_i.set_xlim(map_extent[0], map_extent[1])
+    ax_i.set_ylim(map_extent[2], map_extent[3])
+    ax_i.set_title(f"Spatial Lag ML predicted (AIC = {lag_model.aic:.1f})", loc="left")
+    ax_i.set_axis_off()
+else:
+    ax_i.axis("off")
+    ax_i.text(0.5, 0.5, "Spatial Lag model\nnot available",
+              ha="center", va="center", transform=ax_i.transAxes)
+add_panel_label(ax_i, "i")
+
+fig.suptitle(
+    f"Spatial regression of observed urban conversion — NCI-BR | {MUNICIPALITY}, SP",
+    fontsize=13, fontweight="bold", y=0.995
+)
+fig.text(
+    0.02, 0.005,
+    f"Dependent variable: log(1 + new urban ha per 1-km cell). "
+    f"Predictors: standardised NCI-BR components. Weights: {weights_type}.",
+    fontsize=7.5, color="#4d4d4d"
+)
+
+fig_png = DIRS["figures"] / "figure_11_nci_br_sjc_spatial_regression.png"
+fig_pdf = DIRS["figures"] / "figure_11_nci_br_sjc_spatial_regression.pdf"
+
+plt.savefig(fig_png, dpi=CONFIG["figure_dpi"], bbox_inches="tight")
+plt.savefig(fig_pdf, dpi=CONFIG["figure_dpi"], bbox_inches="tight")
+plt.show()
+print(f"\nFigure exported:\n  {fig_png}\n  {fig_pdf}")
+
+# ------------------------------------------------------------
+# 14. MD5 checksums + metadata
+# ------------------------------------------------------------
+
+def md5_checksum(fp):
+    h = hashlib.md5()
+    with open(fp, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+checksums = {fp.name: md5_checksum(fp)
+             for fp in [reg_gpkg_path, comp_path, coef_path]}
+checksums_path = DIRS["metadata"] / "nci_br_block12_checksums.json"
+with open(checksums_path, "w") as f:
+    json.dump(checksums, f, indent=4)
+
+block12_metadata = {
+    "block": "12", "version": "final",
+    "municipality": MUNICIPALITY,
+    "boundary_source": str(muni_path),
+    "response_variable": response_col,
+    "transformed_response": "log1p(observed_new_urban_area_ha)",
+    "predictors": available_predictors,
+    "weights": weights_type,
+    "models_fitted": model_comparison["model"].tolist(),
+    "best_aic_model": best_aic,
+    "ols_r2": round(ols_sm.rsquared, 4),
+    "resid_moran_I": round(resid_moran.I, 4),
+    "resid_moran_p": round(resid_moran.p_sim, 4),
+    "outputs": {
+        "regression_gpkg": str(reg_gpkg_path),
+        "model_comparison": str(comp_path),
+        "coefficients": str(coef_path),
+        "interpretation": str(interp_path),
+        "figure_png": str(fig_png),
+        "checksums": str(checksums_path),
+    },
+    "created_at": datetime.now().isoformat(),
+}
+
+metadata_path = DIRS["metadata"] / "nci_br_block12_metadata.json"
+with open(metadata_path, "w", encoding="utf-8") as f:
+    json.dump(block12_metadata, f, indent=4, ensure_ascii=False)
+print(f"Metadata saved: {metadata_path}")
+logger.info("Block 12 completed.")
+
+# ------------------------------------------------------------
+# 15. Final summary
+# ------------------------------------------------------------
+
+print("\n" + "=" * 62)
+print(f"BLOCK 12 — COMPLETED | {MUNICIPALITY}")
+print("=" * 62)
+print(f"  Spatial weights  : {weights_type}")
+print(f"  Regression cells : {len(model_gdf)}")
+print(f"  OLS R²           : {ols_sm.rsquared:.4f}")
+print(f"  OLS AIC          : {ols_sm.aic:.2f}")
+print(f"  Resid. Moran I   : {resid_moran.I:.4f} (p = {resid_moran.p_sim:.4f})")
+if lag_ok: print(f"  Spatial Lag AIC  : {lag_model.aic:.2f}")
+print(f"  Best AIC model   : {best_aic}")
+print(f"\n  Top predictors (OLS |β|):")
+for _, r in interpretation_df.sort_values("std_coef_OLS", key=abs,
+                                           ascending=False).head(4).iterrows():
+    print(f"    {r['predictor']:<30}: β={r['std_coef_OLS']:+.3f}, p={r['p_value']:.3f}")
+print("=" * 62)
