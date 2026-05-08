@@ -1,0 +1,703 @@
+# ============================================================
+# BRAZIL NCI-BR PROJECT
+# BLOCK 14 — FRAGMENTATION AND CONNECTIVITY METRICS
+# REAL DATA ONLY — MAPBIOMAS OBSERVED NATIVE VEGETATION
+# FOCUS: SÃO JOSÉ DOS CAMPOS — SP, BRAZIL
+# ============================================================
+#
+# Boundary pattern: identical to Block 03 section 4.
+#   muni_path = DIRS["processed"] / "nci_br_sjc_municipality.gpkg"
+#   muni_gdf  = gpd.read_file(muni_path)
+#   muni_plot = muni_gdf.to_crs(plot_crs)
+#   map_extent from muni_plot.total_bounds
+# ============================================================
+
+import io
+import json
+import logging
+import hashlib
+import requests
+from pathlib import Path
+from datetime import datetime
+
+import ee
+import geemap
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+from matplotlib.colors import TwoSlopeNorm
+
+# ------------------------------------------------------------
+# 1. Reload project configuration
+# ------------------------------------------------------------
+
+PROJECT_ROOT = Path("/content/drive/MyDrive/Brazil/NCI_BR_Project")
+
+DIRS = {
+    "root":         PROJECT_ROOT,
+    "raw":          PROJECT_ROOT / "01_raw",
+    "intermediate": PROJECT_ROOT / "02_intermediate",
+    "processed":    PROJECT_ROOT / "03_processed",
+    "tables":       PROJECT_ROOT / "04_tables",
+    "figures":      PROJECT_ROOT / "05_figures",
+    "maps":         PROJECT_ROOT / "06_maps",
+    "exports":      PROJECT_ROOT / "07_exports",
+    "logs":         PROJECT_ROOT / "08_logs",
+    "metadata":     PROJECT_ROOT / "09_metadata",
+}
+for d in DIRS.values():
+    d.mkdir(parents=True, exist_ok=True)
+
+config_path = DIRS["metadata"] / "nci_br_config.json"
+with open(config_path, "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
+
+plot_crs      = CONFIG.get("output_crs", "EPSG:5880")
+MUNICIPALITY  = "São José dos Campos"
+BASELINE_YEAR = int(CONFIG["baseline_year"])
+
+# ------------------------------------------------------------
+# 2. Logging
+# ------------------------------------------------------------
+
+log_file = DIRS["logs"] / f"nci_br_block14_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+logging.basicConfig(
+    filename=log_file, level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger("NCI_BR_BLOCK14")
+logger.info(f"Block 14 started — {MUNICIPALITY}.")
+print(f"Log file: {log_file}")
+
+# ------------------------------------------------------------
+# 3. Earth Engine initialization
+# ------------------------------------------------------------
+
+try:
+    ee.Initialize(project=CONFIG["gee_project_id"])
+    print("Google Earth Engine initialized.")
+except Exception:
+    ee.Authenticate()
+    ee.Initialize(project=CONFIG["gee_project_id"])
+    print("Google Earth Engine initialized after authentication.")
+
+# ------------------------------------------------------------
+# 4. Load SJC boundary — EXACT SAME PATTERN AS BLOCK 03
+# ------------------------------------------------------------
+
+muni_path = DIRS["processed"] / "nci_br_sjc_municipality.gpkg"
+
+if not muni_path.exists():
+    print("nci_br_sjc_municipality.gpkg not found.")
+    print("Downloading real SJC boundary from IBGE API (code 3549904)...")
+    url = ("https://servicodados.ibge.gov.br/api/v3/malhas/municipios"
+           "/3549904?formato=application/json&qualidade=maxima")
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    muni_gdf = gpd.read_file(io.BytesIO(resp.content))
+    muni_gdf = muni_gdf.set_crs("EPSG:4326").to_crs("EPSG:4674")
+    muni_gdf["NM_MUN"]   = MUNICIPALITY
+    muni_gdf["CD_MUN"]   = "3549904"
+    muni_gdf["SIGLA_UF"] = "SP"
+    muni_gdf.to_file(muni_path, driver="GPKG")
+    print(f"  Saved to: {muni_path.name}")
+else:
+    muni_gdf = gpd.read_file(muni_path)
+    print(f"Municipal boundary loaded: {muni_path.name}")
+
+if muni_gdf.crs is None:
+    muni_gdf = muni_gdf.set_crs("EPSG:4674")
+
+muni_plot = muni_gdf.to_crs(plot_crs)
+
+xmin, ymin, xmax, ymax = muni_plot.total_bounds
+xbuf = (xmax - xmin) * 0.05
+ybuf = (ymax - ymin) * 0.05
+map_extent = [xmin - xbuf, xmax + xbuf, ymin - ybuf, ymax + ybuf]
+
+muni_ee  = geemap.geopandas_to_ee(muni_gdf.to_crs("EPSG:4326"))
+aoi_geom = muni_ee.geometry()
+
+print(f"Municipality : {MUNICIPALITY}")
+print(f"Map extent   : {xmin:.0f}, {ymin:.0f} → {xmax:.0f}, {ymax:.0f}")
+
+# ------------------------------------------------------------
+# 5. Load and clip grid to real SJC polygon
+# ------------------------------------------------------------
+
+CANDIDATE_GRIDS = [
+    DIRS["processed"] / "nci_br_sjc_grid_1km.gpkg",
+    DIRS["processed"] / "nci_br_pilot_grid_1km.gpkg",
+]
+grid_path = next((p for p in CANDIDATE_GRIDS if p.exists()), None)
+if grid_path is None:
+    raise FileNotFoundError("Grid file not found. Run Block 02 first.")
+
+grid_gdf = gpd.read_file(grid_path)
+if grid_gdf.crs is None:
+    grid_gdf = grid_gdf.set_crs(plot_crs)
+grid_gdf = grid_gdf.to_crs(plot_crs)
+
+# Clip grid to real SJC polygon — same pattern as Block 03
+n_before = len(grid_gdf)
+grid_gdf = gpd.clip(grid_gdf, muni_plot).reset_index(drop=True)
+print(f"Grid clip    : {n_before} → {len(grid_gdf)} cells")
+
+if "grid_area_ha" not in grid_gdf.columns:
+    grid_gdf["grid_area_ha"] = grid_gdf.geometry.area / 1e4
+
+grid_ee = geemap.geopandas_to_ee(grid_gdf.to_crs("EPSG:4326"))
+
+# ------------------------------------------------------------
+# 6. Helper functions
+# ------------------------------------------------------------
+
+def clip_image_to_aoi(image: ee.Image, geom: ee.Geometry) -> ee.Image:
+    return (image.clip(geom)
+            .updateMask(ee.Image.constant(1).clip(geom).unmask(0)))
+
+
+def area_band(mask: ee.Image, name: str) -> ee.Image:
+    return ee.Image.pixelArea().divide(1e4).updateMask(mask).rename(name)
+
+
+def find_col(df, prefix, must_contain=None):
+    for c in df.columns:
+        if c.startswith(prefix):
+            if must_contain is None or must_contain in c:
+                return c
+    return None
+
+
+def safe_fraction(df, num_col, den_col, out_name):
+    if num_col is None or den_col is None or den_col not in df.columns:
+        df[out_name] = np.nan
+        return
+    df[out_name] = np.where(df[den_col] > 0,
+                             df[num_col] / df[den_col],
+                             np.nan)
+
+
+def md5_checksum(fp: Path) -> str:
+    h = hashlib.md5()
+    with open(fp, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+# ------------------------------------------------------------
+# 7. MapBiomas and native vegetation classes
+# ------------------------------------------------------------
+
+mapbiomas       = ee.Image(CONFIG["mapbiomas_asset"])
+REFERENCE_YEARS = [1985, 2000, 2010, 2015, BASELINE_YEAR]
+NATIVE_CLASSES  = [3, 4, 5, 6, 11, 12, 32, 49, 50]
+
+
+def class_mask(img, classes):
+    return img.remap(classes, [1] * len(classes), 0).eq(1)
+
+# ------------------------------------------------------------
+# 8. Build fragmentation indicator stack
+# ------------------------------------------------------------
+
+fragmentation_bands = []
+
+for year in REFERENCE_YEARS:
+    lulc   = clip_image_to_aoi(
+        mapbiomas.select(f"classification_{year}"), aoi_geom
+    )
+    native = class_mask(lulc, NATIVE_CLASSES)
+
+    native_area = area_band(native, f"native_area_{year}_ha")
+
+    # Edge: native pixels with at least one non-native neighbour
+    nbr_sum   = native.reduceNeighborhood(
+        reducer=ee.Reducer.sum(),
+        kernel=ee.Kernel.square(radius=1, units="pixels"),
+        skipMasked=False
+    )
+    edge_native = native.And(nbr_sum.lt(9))
+    edge_area   = area_band(edge_native, f"native_edge_area_{year}_ha")
+
+    # Core: native pixels whose full 3×3 neighbourhood is native
+    core_native = native.And(nbr_sum.eq(9))
+    core_area   = area_band(core_native, f"native_core_area_{year}_ha")
+
+    # Local native density within 300 m
+    local_density = native.reduceNeighborhood(
+        reducer=ee.Reducer.mean(),
+        kernel=ee.Kernel.circle(radius=300, units="meters"),
+        skipMasked=False
+    ).rename(f"local_native_density_{year}")
+
+    # Connected (density ≥ 0.5) and fragmented (density < 0.3)
+    connected_area  = area_band(native.And(local_density.gte(0.5)),
+                                f"connected_native_area_{year}_ha")
+    fragmented_area = area_band(native.And(local_density.lt(0.3)),
+                                f"fragmented_native_area_{year}_ha")
+
+    fragmentation_bands += [
+        native_area, edge_area, core_area,
+        connected_area, fragmented_area, local_density
+    ]
+
+fragmentation_stack = fragmentation_bands[0]
+for b in fragmentation_bands[1:]:
+    fragmentation_stack = fragmentation_stack.addBands(b)
+
+# ------------------------------------------------------------
+# 9. Extract metrics per grid cell — tileScale=4
+# ------------------------------------------------------------
+
+print("\nExtracting fragmentation metrics per 1-km cell...")
+
+frag_fc  = fragmentation_stack.reduceRegions(
+    collection=grid_ee,
+    reducer=ee.Reducer.sum().combine(ee.Reducer.mean(), sharedInputs=True),
+    scale=30,
+    tileScale=4
+)
+
+frag_gdf = geemap.ee_to_gdf(frag_fc)
+if frag_gdf.crs is None:
+    frag_gdf = frag_gdf.set_crs("EPSG:4326")
+frag_gdf = frag_gdf.to_crs(plot_crs)
+
+print(f"\nColumns from GEE (first 60): {sorted(frag_gdf.columns)[:60]}")
+
+# ------------------------------------------------------------
+# 10. Merge grid_area_ha if missing
+# ------------------------------------------------------------
+
+if "grid_area_ha" not in frag_gdf.columns:
+    if "grid_id" in frag_gdf.columns:
+        frag_gdf = frag_gdf.merge(
+            grid_gdf[["grid_id", "grid_area_ha"]], on="grid_id", how="left"
+        )
+    else:
+        frag_gdf["grid_area_ha"] = frag_gdf.geometry.area / 1e4
+
+frag_gdf["grid_area_ha"] = pd.to_numeric(
+    frag_gdf["grid_area_ha"], errors="coerce"
+).fillna(frag_gdf.geometry.area / 1e4)
+
+analysis_gdf = frag_gdf.copy()
+
+# ------------------------------------------------------------
+# 11. Derive per-year fraction metrics
+# ------------------------------------------------------------
+
+for year in REFERENCE_YEARS:
+    # Coerce raw columns
+    for c in analysis_gdf.columns:
+        if str(year) in c:
+            analysis_gdf[c] = pd.to_numeric(analysis_gdf[c], errors="coerce").fillna(0)
+
+    native_col     = find_col(analysis_gdf, f"native_area_{year}",            must_contain="ha")
+    edge_col       = find_col(analysis_gdf, f"native_edge_area_{year}",       must_contain="ha")
+    core_col       = find_col(analysis_gdf, f"native_core_area_{year}",       must_contain="ha")
+    connected_col  = find_col(analysis_gdf, f"connected_native_area_{year}",  must_contain="ha")
+    fragmented_col = find_col(analysis_gdf, f"fragmented_native_area_{year}", must_contain="ha")
+    density_col    = find_col(analysis_gdf, f"local_native_density_{year}")
+
+    missing = [n for n, c in [("native", native_col), ("edge", edge_col),
+                                ("core", core_col), ("connected", connected_col),
+                                ("fragmented", fragmented_col)] if c is None]
+    if missing:
+        print(f"  WARNING year {year}: missing columns for {missing}")
+    else:
+        print(f"  Year {year}: all columns resolved OK")
+
+    if native_col:
+        analysis_gdf[f"native_fraction_{year}"] = (
+            analysis_gdf[native_col] / analysis_gdf["grid_area_ha"]
+        ).clip(0, 1)
+    else:
+        analysis_gdf[f"native_fraction_{year}"] = np.nan
+
+    safe_fraction(analysis_gdf, edge_col,       native_col, f"edge_frac_of_native_{year}")
+    safe_fraction(analysis_gdf, core_col,       native_col, f"core_frac_of_native_{year}")
+    safe_fraction(analysis_gdf, connected_col,  native_col, f"connected_frac_of_native_{year}")
+    safe_fraction(analysis_gdf, fragmented_col, native_col, f"fragmented_frac_of_native_{year}")
+
+    if density_col:
+        analysis_gdf[f"mean_local_density_{year}"] = pd.to_numeric(
+            analysis_gdf[density_col], errors="coerce"
+        )
+    else:
+        analysis_gdf[f"mean_local_density_{year}"] = np.nan
+
+# ------------------------------------------------------------
+# 12. Change and composite scores
+# ------------------------------------------------------------
+
+analysis_gdf["native_frac_change"] = (
+    analysis_gdf[f"native_fraction_{BASELINE_YEAR}"]
+    - analysis_gdf["native_fraction_1985"]
+)
+analysis_gdf["core_frac_change"] = (
+    analysis_gdf[f"core_frac_of_native_{BASELINE_YEAR}"]
+    - analysis_gdf["core_frac_of_native_1985"]
+)
+analysis_gdf["connected_frac_change"] = (
+    analysis_gdf[f"connected_frac_of_native_{BASELINE_YEAR}"]
+    - analysis_gdf["connected_frac_of_native_1985"]
+)
+
+# Fragmentation risk score (higher = more fragmented)
+analysis_gdf["fragmentation_risk"] = (
+    analysis_gdf[f"edge_frac_of_native_{BASELINE_YEAR}"].rank(pct=True)        * 40
+    + (1 - analysis_gdf[f"core_frac_of_native_{BASELINE_YEAR}"].rank(pct=True)) * 30
+    + (1 - analysis_gdf[f"connected_frac_of_native_{BASELINE_YEAR}"].rank(pct=True)) * 30
+)
+
+# Connectivity conservation score (higher = better)
+analysis_gdf["connectivity_score"] = (
+    analysis_gdf[f"native_fraction_{BASELINE_YEAR}"].rank(pct=True)        * 35
+    + analysis_gdf[f"core_frac_of_native_{BASELINE_YEAR}"].rank(pct=True)  * 30
+    + analysis_gdf[f"connected_frac_of_native_{BASELINE_YEAR}"].rank(pct=True) * 35
+)
+
+# ------------------------------------------------------------
+# 13. Merge NCI-BR if available
+# ------------------------------------------------------------
+
+NCI_CANDIDATES = [
+    DIRS["processed"] / "nci_br_sjc_evidence_synthesis.gpkg",
+    DIRS["processed"] / "nci_br_sjc_spatial_statistics.gpkg",
+    DIRS["processed"] / "nci_br_sjc_grid_integrated_index.gpkg",
+    DIRS["processed"] / "nci_br_real_data_evidence_synthesis_map.gpkg",
+    DIRS["processed"] / "nci_br_grid_integrated_index.gpkg",
+]
+nci_path = next((p for p in NCI_CANDIDATES if p.exists()), None)
+
+if nci_path:
+    nci_gdf = gpd.read_file(nci_path)
+    nci_cols = [c for c in ["grid_id", "NCI_BR", "NCI_BR_class",
+                             "evidence_class", "observed_evidence_class",
+                             "LISA_cluster", "Gi_cluster"]
+                if c in nci_gdf.columns]
+    if "grid_id" in nci_cols:
+        analysis_gdf = analysis_gdf.merge(
+            pd.DataFrame(nci_gdf[nci_cols]),
+            on="grid_id", how="left", suffixes=("", "_nci")
+        )
+    print(f"NCI-BR merged from: {nci_path.name}")
+
+# ------------------------------------------------------------
+# 14. Summary tables
+# ------------------------------------------------------------
+
+summary_records = []
+for year in REFERENCE_YEARS:
+    for metric, col in [
+        ("native_fraction",        f"native_fraction_{year}"),
+        ("edge_frac_of_native",    f"edge_frac_of_native_{year}"),
+        ("core_frac_of_native",    f"core_frac_of_native_{year}"),
+        ("connected_frac_of_native", f"connected_frac_of_native_{year}"),
+        ("fragmented_frac_of_native",f"fragmented_frac_of_native_{year}"),
+    ]:
+        if col in analysis_gdf.columns:
+            summary_records.append({
+                "year": year, "metric": metric,
+                "value": analysis_gdf[col].mean(), "unit": "fraction"
+            })
+
+summary_df   = pd.DataFrame(summary_records)
+
+change_df = pd.DataFrame([
+    ("native_fraction_change_1985–2024", analysis_gdf["native_frac_change"].mean(), "fraction pts"),
+    ("core_frac_change_1985–2024",       analysis_gdf["core_frac_change"].mean(),   "fraction pts"),
+    ("connected_frac_change_1985–2024",  analysis_gdf["connected_frac_change"].mean(),"fraction pts"),
+    ("mean_fragmentation_risk_score",    analysis_gdf["fragmentation_risk"].mean(),  "0–100 rank"),
+    ("mean_connectivity_score",          analysis_gdf["connectivity_score"].mean(),  "0–100 rank"),
+], columns=["metric", "value", "unit"])
+
+# ------------------------------------------------------------
+# 15. Export products
+# ------------------------------------------------------------
+
+out_gpkg  = DIRS["processed"] / "nci_br_sjc_fragmentation_connectivity.gpkg"
+out_csv   = DIRS["tables"]    / "nci_br_sjc_fragmentation_connectivity.csv"
+sum_csv   = DIRS["tables"]    / "nci_br_sjc_fragmentation_summary_by_year.csv"
+chng_csv  = DIRS["tables"]    / "nci_br_sjc_fragmentation_change_summary.csv"
+
+analysis_gdf.to_file(out_gpkg, layer="fragmentation_connectivity", driver="GPKG")
+pd.DataFrame(analysis_gdf.drop(columns="geometry", errors="ignore")).to_csv(
+    out_csv, index=False, encoding="utf-8-sig"
+)
+summary_df.to_csv(sum_csv,   index=False, encoding="utf-8-sig")
+change_df.to_csv(chng_csv,   index=False, encoding="utf-8-sig")
+
+print(f"\nOutputs exported:")
+for p in [out_gpkg, out_csv, sum_csv, chng_csv]:
+    print(f"  {p}")
+logger.info(f"Outputs exported. n={len(analysis_gdf)}")
+
+# ------------------------------------------------------------
+# 16. Cartographic helpers — IDENTICAL to Block 03
+# ------------------------------------------------------------
+
+def add_panel_label(ax, label):
+    ax.text(0.02, 0.97, label, transform=ax.transAxes,
+            fontsize=12, fontweight="bold", va="top", ha="left",
+            bbox=dict(facecolor="white", edgecolor="none",
+                      alpha=0.88, boxstyle="round,pad=0.22"))
+
+def overlay_boundary(ax, gdf):
+    """Overlay municipal boundary on any map panel."""
+    gdf.boundary.plot(ax=ax, edgecolor="black", linewidth=1.2, zorder=5)
+
+def safe_choropleth(gdf, column, ax, cmap,
+                    legend=True, vmin=None, vmax=None, norm=None):
+    """Plot choropleth safely; grey panel if column missing or all-NaN."""
+    if column not in gdf.columns or gdf[column].dropna().empty:
+        gdf.plot(ax=ax, color="lightgrey", linewidth=0)
+        ax.text(0.5, 0.5, f"No data\n({column})",
+                transform=ax.transAxes, ha="center", va="center",
+                fontsize=8, color="#666",
+                bbox=dict(facecolor="white", alpha=0.7))
+        return
+    valid = gdf[column].dropna()
+    vmin  = vmin if vmin is not None else float(valid.min())
+    vmax  = vmax if vmax is not None else float(valid.max())
+    kw = dict(column=column, ax=ax, legend=legend, cmap=cmap,
+              linewidth=0.0, vmin=vmin, vmax=vmax,
+              missing_kwds={"color": "lightgrey"})
+    if norm is not None:
+        kw["norm"] = norm; kw.pop("vmin"); kw.pop("vmax")
+    gdf.plot(**kw)
+
+# Project for plotting
+plot_gdf = analysis_gdf.to_crs(plot_crs)
+
+# ------------------------------------------------------------
+# 17. Figure — 9 panels using Block 03 map pattern exactly
+# ------------------------------------------------------------
+
+plt.rcParams.update({
+    "figure.dpi": 150, "savefig.dpi": CONFIG["figure_dpi"],
+    "font.family": "DejaVu Sans", "font.size": 9.5,
+    "axes.titlesize": 10, "axes.labelsize": 9,
+    "legend.fontsize": 8.5, "axes.linewidth": 0.7,
+    "pdf.fonttype": 42, "ps.fonttype": 42, "savefig.bbox": "tight",
+})
+
+fig = plt.figure(figsize=(16, 11), dpi=150)
+gs  = fig.add_gridspec(
+    nrows=3, ncols=3,
+    width_ratios=[1.2, 1.2, 1.0],
+    height_ratios=[1, 1, 1],
+    wspace=0.22, hspace=0.32
+)
+ax_a = fig.add_subplot(gs[0, 0])
+ax_b = fig.add_subplot(gs[0, 1])
+ax_c = fig.add_subplot(gs[0, 2])
+ax_d = fig.add_subplot(gs[1, 0])
+ax_e = fig.add_subplot(gs[1, 1])
+ax_f = fig.add_subplot(gs[1, 2])
+ax_g = fig.add_subplot(gs[2, 0])
+ax_h = fig.add_subplot(gs[2, 1])
+ax_i = fig.add_subplot(gs[2, 2])
+
+# ── Panel a — Native fraction (baseline) ─────────────────────
+safe_choropleth(plot_gdf, f"native_fraction_{BASELINE_YEAR}", ax_a, "YlGn",
+                vmin=0, vmax=1)
+overlay_boundary(ax_a, muni_plot)
+ax_a.set_xlim(map_extent[0], map_extent[1])
+ax_a.set_ylim(map_extent[2], map_extent[3])
+ax_a.set_title(f"Native vegetation fraction ({BASELINE_YEAR})", loc="left")
+ax_a.set_axis_off()
+add_panel_label(ax_a, "a")
+
+# ── Panel b — Core fraction ───────────────────────────────────
+safe_choropleth(plot_gdf, f"core_frac_of_native_{BASELINE_YEAR}", ax_b, "Greens",
+                vmin=0, vmax=1)
+overlay_boundary(ax_b, muni_plot)
+ax_b.set_xlim(map_extent[0], map_extent[1])
+ax_b.set_ylim(map_extent[2], map_extent[3])
+ax_b.set_title("Core fraction of native vegetation", loc="left")
+ax_b.set_axis_off()
+add_panel_label(ax_b, "b")
+
+# ── Panel c — Connected fraction ──────────────────────────────
+safe_choropleth(plot_gdf, f"connected_frac_of_native_{BASELINE_YEAR}", ax_c, "YlGnBu",
+                vmin=0, vmax=1)
+overlay_boundary(ax_c, muni_plot)
+ax_c.set_xlim(map_extent[0], map_extent[1])
+ax_c.set_ylim(map_extent[2], map_extent[3])
+ax_c.set_title("Connected fraction of native vegetation", loc="left")
+ax_c.set_axis_off()
+add_panel_label(ax_c, "c")
+
+# ── Panel d — Native fraction change 1985→baseline ───────────
+if "native_frac_change" in plot_gdf.columns:
+    vals = plot_gdf["native_frac_change"].dropna()
+    if len(vals) > 0:
+        vmax_abs = max(abs(float(vals.quantile(0.02))),
+                       abs(float(vals.quantile(0.98))), 0.01)
+        norm_div = TwoSlopeNorm(vmin=-vmax_abs, vcenter=0, vmax=vmax_abs)
+        safe_choropleth(plot_gdf, "native_frac_change", ax_d, "RdYlGn", norm=norm_div)
+overlay_boundary(ax_d, muni_plot)
+ax_d.set_xlim(map_extent[0], map_extent[1])
+ax_d.set_ylim(map_extent[2], map_extent[3])
+ax_d.set_title(f"Native vegetation fraction change 1985–{BASELINE_YEAR}", loc="left")
+ax_d.set_axis_off()
+add_panel_label(ax_d, "d")
+
+# ── Panel e — Landscape structure trajectories ───────────────
+if not summary_df.empty:
+    traj = summary_df.pivot(index="year", columns="metric", values="value").reset_index()
+    colors_e = {"native_fraction": "#1a7a3c", "core_frac_of_native": "#005a32",
+                 "connected_frac_of_native": "#2171b5",
+                 "fragmented_frac_of_native": "#d62728",
+                 "edge_frac_of_native": "#fd8d3c"}
+    for metric in traj.columns[1:]:
+        if metric in traj.columns:
+            short = metric.replace("mean_", "").replace("_frac_of_native", "").replace("_", " ")
+            ax_e.plot(traj["year"], traj[metric], marker="o", linewidth=2,
+                      color=colors_e.get(metric, "#969696"), label=short)
+ax_e.set_title("Mean landscape-structure trajectories", loc="left")
+ax_e.set_xlabel("Year")
+ax_e.set_ylabel("Fraction")
+ax_e.legend(fontsize=6.5, framealpha=0.85)
+ax_e.grid(True, linewidth=0.3, alpha=0.5)
+add_panel_label(ax_e, "e")
+
+# ── Panel f — Change summary table ───────────────────────────
+ax_f.axis("off")
+chng_disp = change_df.copy()
+chng_disp["value"] = chng_disp["value"].map(
+    lambda x: f"{x:.4f}" if pd.notna(x) else "NA"
+)
+tbl = ax_f.table(
+    cellText=chng_disp[["metric", "value", "unit"]].values,
+    colLabels=["Metric", "Value", "Unit"],
+    loc="center", cellLoc="center"
+)
+tbl.auto_set_font_size(False); tbl.set_fontsize(6.5); tbl.scale(1.0, 1.38)
+for (row, col), cell in tbl.get_celld().items():
+    cell.set_edgecolor("#bdbdbd"); cell.set_linewidth(0.5)
+    if row == 0:
+        cell.set_facecolor("#f0f0f0"); cell.set_text_props(weight="bold")
+ax_f.set_title("Fragmentation and connectivity change", loc="left")
+add_panel_label(ax_f, "f")
+
+# ── Panel g — Fragmentation risk score map ───────────────────
+safe_choropleth(plot_gdf, "fragmentation_risk", ax_g, "YlOrRd")
+overlay_boundary(ax_g, muni_plot)
+ax_g.set_xlim(map_extent[0], map_extent[1])
+ax_g.set_ylim(map_extent[2], map_extent[3])
+ax_g.set_title(f"Fragmentation risk score ({BASELINE_YEAR})", loc="left")
+ax_g.set_axis_off()
+add_panel_label(ax_g, "g")
+
+# ── Panel h — Connectivity conservation score map ────────────
+safe_choropleth(plot_gdf, "connectivity_score", ax_h, "YlGn")
+overlay_boundary(ax_h, muni_plot)
+ax_h.set_xlim(map_extent[0], map_extent[1])
+ax_h.set_ylim(map_extent[2], map_extent[3])
+ax_h.set_title(f"Connectivity conservation score ({BASELINE_YEAR})", loc="left")
+ax_h.set_axis_off()
+add_panel_label(ax_h, "h")
+
+# ── Panel i — NCI-BR vs connectivity scatter ─────────────────
+if "NCI_BR" in analysis_gdf.columns:
+    valid = analysis_gdf[
+        analysis_gdf["connectivity_score"].notna() &
+        analysis_gdf["NCI_BR"].notna()
+    ]
+    ax_i.scatter(valid["NCI_BR"], valid["connectivity_score"],
+                 s=8, alpha=0.45, color="#1a7a3c")
+    if len(valid) > 2:
+        coef = np.polyfit(valid["NCI_BR"], valid["connectivity_score"], 1)
+        xl = np.linspace(valid["NCI_BR"].min(), valid["NCI_BR"].max(), 100)
+        ax_i.plot(xl, coef[0] * xl + coef[1], "k-", linewidth=1.5)
+        corr = float(valid[["NCI_BR", "connectivity_score"]].corr().iloc[0, 1])
+        ax_i.text(0.97, 0.95, f"r = {corr:.3f}",
+                  transform=ax_i.transAxes, ha="right", va="top", fontsize=8.5,
+                  bbox=dict(facecolor="white", edgecolor="#bdbdbd", boxstyle="round,pad=0.3"))
+    ax_i.set_xlabel("NCI-BR score")
+    ax_i.set_ylabel("Connectivity conservation score")
+    ax_i.set_title("NCI-BR vs connectivity score", loc="left")
+    ax_i.grid(True, linewidth=0.3, alpha=0.5)
+else:
+    ax_i.axis("off")
+    ax_i.text(0.5, 0.5, "NCI-BR not available",
+              ha="center", va="center", transform=ax_i.transAxes)
+add_panel_label(ax_i, "i")
+
+fig.suptitle(
+    f"Native vegetation fragmentation and connectivity — NCI-BR | {MUNICIPALITY}, SP",
+    fontsize=13, fontweight="bold", y=0.995
+)
+fig.text(
+    0.02, 0.005,
+    "Metrics derived from observed MapBiomas native vegetation classes. "
+    "Core, edge, connected, and fragmented: spatial proxies from land-cover configuration.",
+    fontsize=7.5, color="#4d4d4d"
+)
+
+fig_png = DIRS["figures"] / "figure_13_nci_br_sjc_fragmentation_connectivity.png"
+fig_pdf = DIRS["figures"] / "figure_13_nci_br_sjc_fragmentation_connectivity.pdf"
+
+plt.savefig(fig_png, dpi=CONFIG["figure_dpi"], bbox_inches="tight")
+plt.savefig(fig_pdf, dpi=CONFIG["figure_dpi"], bbox_inches="tight")
+plt.show()
+print(f"\nFigure exported:\n  {fig_png}\n  {fig_pdf}")
+
+# ------------------------------------------------------------
+# 18. MD5 checksums + metadata
+# ------------------------------------------------------------
+
+checksums = {fp.name: md5_checksum(fp) for fp in [out_gpkg, out_csv]}
+checksums_path = DIRS["metadata"] / "nci_br_block14_checksums.json"
+with open(checksums_path, "w") as f:
+    json.dump(checksums, f, indent=4)
+
+block14_metadata = {
+    "block": "14", "version": "final",
+    "municipality": MUNICIPALITY,
+    "boundary_source": str(muni_path),
+    "native_classes": NATIVE_CLASSES,
+    "reference_years": REFERENCE_YEARS,
+    "metrics": ["native_fraction", "edge_frac_of_native", "core_frac_of_native",
+                 "connected_frac_of_native", "fragmented_frac_of_native",
+                 "fragmentation_risk", "connectivity_score"],
+    "outputs": {
+        "fragmentation_gpkg": str(out_gpkg),
+        "fragmentation_csv":  str(out_csv),
+        "summary_by_year":    str(sum_csv),
+        "change_summary":     str(chng_csv),
+        "figure_png":         str(fig_png),
+        "checksums":          str(checksums_path),
+    },
+    "created_at": datetime.now().isoformat(),
+}
+
+metadata_path = DIRS["metadata"] / "nci_br_block14_metadata.json"
+with open(metadata_path, "w", encoding="utf-8") as f:
+    json.dump(block14_metadata, f, indent=4, ensure_ascii=False)
+print(f"Metadata saved: {metadata_path}")
+logger.info("Block 14 completed.")
+
+# ------------------------------------------------------------
+# 19. Final summary
+# ------------------------------------------------------------
+
+print("\n" + "=" * 62)
+print(f"BLOCK 14 — COMPLETED | {MUNICIPALITY}")
+print("=" * 62)
+print(f"  Grid cells (SJC) : {len(analysis_gdf)}")
+print(f"  Reference years  : {REFERENCE_YEARS}")
+for year in [1985, BASELINE_YEAR]:
+    nf = analysis_gdf[f"native_fraction_{year}"].mean()
+    cf = analysis_gdf[f"core_frac_of_native_{year}"].mean()
+    print(f"  {year}: native = {nf:.3f} | core = {cf:.3f}")
+print(f"  Δ native frac    : {analysis_gdf['native_frac_change'].mean():+.4f}")
+print(f"  Mean frag. risk  : {analysis_gdf['fragmentation_risk'].mean():.1f}")
+print(f"  Mean conn. score : {analysis_gdf['connectivity_score'].mean():.1f}")
+print("=" * 62)
+print("\nNext block: NCI-BR uncertainty and sensitivity analysis.")
