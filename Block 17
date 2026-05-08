@@ -1,0 +1,1205 @@
+# ============================================================
+# BRAZIL NCI-BR PROJECT
+# BLOCK 17 — TEMPORAL CARBON STOCK AND NATURAL-CAPITAL COUPLING
+# ESA CCI ABOVE-GROUND BIOMASS v6.0
+# REAL DATA ONLY — NO SYNTHETIC FOOTPRINTS
+# FOCUS: SÃO JOSÉ DOS CAMPOS — SP, BRAZIL
+# ============================================================
+
+import io
+import json
+import logging
+import hashlib
+import requests
+from pathlib import Path
+from datetime import datetime
+
+import ee
+import geemap
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.colors import TwoSlopeNorm
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+
+PROJECT_ROOT = Path("/content/drive/MyDrive/Brazil/NCI_BR_Project")
+
+DIRS = {
+    "root": PROJECT_ROOT,
+    "raw": PROJECT_ROOT / "01_raw",
+    "intermediate": PROJECT_ROOT / "02_intermediate",
+    "processed": PROJECT_ROOT / "03_processed",
+    "tables": PROJECT_ROOT / "04_tables",
+    "figures": PROJECT_ROOT / "05_figures",
+    "maps": PROJECT_ROOT / "06_maps",
+    "exports": PROJECT_ROOT / "07_exports",
+    "logs": PROJECT_ROOT / "08_logs",
+    "metadata": PROJECT_ROOT / "09_metadata",
+}
+
+for d in DIRS.values():
+    d.mkdir(parents=True, exist_ok=True)
+
+with open(DIRS["metadata"] / "nci_br_config.json", "r", encoding="utf-8") as f:
+    CONFIG = json.load(f)
+
+OUTPUT_CRS = CONFIG.get("output_crs", "EPSG:5880")
+BASELINE_YEAR = int(CONFIG["baseline_year"])
+FIG_DPI = CONFIG.get("figure_dpi", 500)
+
+MUNICIPALITY = "São José dos Campos"
+MUNI_CODE = "3549904"
+
+# ============================================================
+# 2. LOGGING
+# ============================================================
+
+log_file = DIRS["logs"] / f"nci_br_block17_sjc_esa_cci_carbon_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+logging.basicConfig(
+    filename=log_file,
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+logger = logging.getLogger("NCI_BR_BLOCK17_SJC_ESA_CCI")
+logger.info(f"Block 17 started — {MUNICIPALITY}.")
+
+print(f"Log file created at: {log_file}")
+
+# ============================================================
+# 3. EARTH ENGINE INITIALIZATION
+# ============================================================
+
+try:
+    ee.Initialize(project=CONFIG["gee_project_id"])
+    print("Google Earth Engine initialized.")
+except Exception:
+    ee.Authenticate()
+    ee.Initialize(project=CONFIG["gee_project_id"])
+    print("Google Earth Engine initialized after authentication.")
+
+# ============================================================
+# 4. LOAD SJC MUNICIPAL BOUNDARY
+# ============================================================
+
+muni_path = DIRS["processed"] / "nci_br_sjc_municipality.gpkg"
+
+if not muni_path.exists():
+    print("nci_br_sjc_municipality.gpkg not found.")
+    print("Downloading real SJC boundary from IBGE API...")
+
+    url = (
+        "https://servicodados.ibge.gov.br/api/v3/malhas/municipios"
+        f"/{MUNI_CODE}?formato=application/json&qualidade=maxima"
+    )
+
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+
+    muni_gdf = gpd.read_file(io.BytesIO(resp.content))
+    muni_gdf = muni_gdf.set_crs("EPSG:4326").to_crs("EPSG:4674")
+    muni_gdf["NM_MUN"] = MUNICIPALITY
+    muni_gdf["CD_MUN"] = MUNI_CODE
+    muni_gdf["SIGLA_UF"] = "SP"
+    muni_gdf.to_file(muni_path, driver="GPKG")
+
+    print(f"Saved to: {muni_path}")
+
+else:
+    muni_gdf = gpd.read_file(muni_path)
+    print(f"Municipal boundary loaded: {muni_path.name}")
+
+if muni_gdf.crs is None:
+    muni_gdf = muni_gdf.set_crs("EPSG:4674")
+
+muni_plot = muni_gdf.to_crs(OUTPUT_CRS)
+
+xmin, ymin, xmax, ymax = muni_plot.total_bounds
+xbuf = (xmax - xmin) * 0.05
+ybuf = (ymax - ymin) * 0.05
+MAP_EXTENT = [xmin - xbuf, xmax + xbuf, ymin - ybuf, ymax + ybuf]
+
+muni_ee = geemap.geopandas_to_ee(muni_gdf.to_crs("EPSG:4326"))
+aoi_geom = muni_ee.geometry()
+
+print(f"Municipality : {MUNICIPALITY}")
+print(f"Map extent   : {xmin:.0f}, {ymin:.0f} → {xmax:.0f}, {ymax:.0f}")
+
+# ============================================================
+# 5. LOAD GRID AND CLIP TO SJC
+# ============================================================
+
+GRID_CANDIDATES = [
+    DIRS["processed"] / "nci_br_sjc_grid_1km.gpkg",
+    DIRS["processed"] / "nci_br_pilot_grid_1km.gpkg",
+]
+
+grid_path = next((p for p in GRID_CANDIDATES if p.exists()), None)
+
+if grid_path is None:
+    raise FileNotFoundError("Grid file not found. Run Block 02 first.")
+
+grid_gdf = gpd.read_file(grid_path)
+
+if grid_gdf.crs is None:
+    grid_gdf = grid_gdf.set_crs(OUTPUT_CRS)
+
+grid_gdf = grid_gdf.to_crs(OUTPUT_CRS)
+
+n_before = len(grid_gdf)
+grid_gdf = gpd.clip(grid_gdf, muni_plot).reset_index(drop=True)
+
+print(f"Grid clip    : {n_before} → {len(grid_gdf)} cells")
+
+if len(grid_gdf) == 0:
+    raise ValueError("No grid cells remained after clipping to SJC.")
+
+grid_gdf["grid_area_ha"] = grid_gdf.geometry.area / 10000
+
+grid_ee = geemap.geopandas_to_ee(grid_gdf.to_crs("EPSG:4326"))
+
+# ============================================================
+# 6. DATASET SETTINGS
+# ============================================================
+
+ESA_CCI_ASSET_PREFIX = "ESA/CCI/Above_Ground_Biomass/V6_0"
+
+BIOMASS_YEARS = [
+    2007, 2010, 2015, 2016, 2017,
+    2018, 2019, 2020, 2021, 2022,
+]
+
+REFERENCE_CARBON_YEAR = 2007
+TARGET_CARBON_YEAR = 2022
+
+CARBON_FRACTION = 0.47
+CO2E_FACTOR = 44 / 12
+
+REF_LULC_YEAR = 1985
+TARGET_LULC_YEAR = BASELINE_YEAR
+
+URBAN_CLASS = 24
+NATIVE_CLASSES = [3, 4, 5, 6, 11, 12, 32, 49, 50]
+
+# ============================================================
+# 7. HELPER FUNCTIONS
+# ============================================================
+
+def clip_image_to_aoi(image, geom):
+    return (
+        image.clip(geom)
+        .updateMask(ee.Image.constant(1).clip(geom).unmask(0))
+    )
+
+
+def find_col(df, startswith_text, suffix=None, required=True):
+    matches = [c for c in df.columns if c.startswith(startswith_text)]
+
+    if suffix is not None:
+        matches_suffix = [c for c in matches if c.endswith(suffix)]
+        if len(matches_suffix) > 0:
+            return matches_suffix[0]
+
+    if len(matches) > 0:
+        return matches[0]
+
+    if required:
+        raise ValueError(f"No column found starting with: {startswith_text}")
+
+    return None
+
+
+def md5_checksum(fp: Path) -> str:
+    h = hashlib.md5()
+    with open(fp, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def add_panel_label(ax, label):
+    ax.text(
+        0.02,
+        0.965,
+        label,
+        transform=ax.transAxes,
+        fontsize=12,
+        fontweight="bold",
+        va="top",
+        ha="left",
+        color="white",
+        bbox=dict(
+            facecolor="#1A3A5C",
+            edgecolor="none",
+            alpha=0.92,
+            boxstyle="round,pad=0.25",
+        ),
+        zorder=20,
+    )
+
+
+def overlay_boundary(ax):
+    muni_plot.boundary.plot(
+        ax=ax,
+        edgecolor="white",
+        linewidth=2.2,
+        zorder=10,
+        alpha=0.9,
+    )
+    muni_plot.boundary.plot(
+        ax=ax,
+        edgecolor="black",
+        linewidth=1.1,
+        zorder=11,
+    )
+
+
+def apply_extent(ax):
+    ax.set_xlim(MAP_EXTENT[0], MAP_EXTENT[1])
+    ax.set_ylim(MAP_EXTENT[2], MAP_EXTENT[3])
+    ax.set_aspect("equal")
+    ax.set_axis_off()
+
+
+def safe_map(gdf, column, ax, cmap, title, unit_label=None, vmin=None, vmax=None, norm=None):
+    if column not in gdf.columns or gdf[column].dropna().empty:
+        gdf.plot(ax=ax, color="#e6e6e6", linewidth=0)
+        ax.text(
+            0.5,
+            0.5,
+            f"No data\n{column}",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            fontsize=8,
+            color="#666666",
+            bbox=dict(facecolor="white", edgecolor="none", alpha=0.80),
+        )
+    else:
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes("right", size="4%", pad=0.06)
+
+        kwargs = dict(
+            column=column,
+            ax=ax,
+            cmap=cmap,
+            linewidth=0,
+            legend=True,
+            missing_kwds={"color": "#e6e6e6"},
+            legend_kwds={"cax": cax, "orientation": "vertical"},
+        )
+
+        if norm is not None:
+            kwargs["norm"] = norm
+        else:
+            if vmin is not None:
+                kwargs["vmin"] = vmin
+            if vmax is not None:
+                kwargs["vmax"] = vmax
+
+        gdf.plot(**kwargs)
+
+        cax.tick_params(labelsize=6.5)
+        if unit_label:
+            cax.set_ylabel(unit_label, fontsize=6.5, labelpad=3)
+
+    overlay_boundary(ax)
+    apply_extent(ax)
+    ax.set_title(title, loc="left", fontsize=9.5, fontweight="bold")
+
+
+# ============================================================
+# 8. VERIFY ESA CCI IMAGE ACCESS
+# ============================================================
+
+try:
+    test_img = ee.Image(f"{ESA_CCI_ASSET_PREFIX}/{TARGET_CARBON_YEAR}")
+    print("\nESA CCI Biomass image bands:")
+    print(test_img.bandNames().getInfo())
+except Exception as e:
+    raise RuntimeError(f"Failed to load ESA CCI Biomass asset: {e}")
+
+# ============================================================
+# 9. BUILD TEMPORAL CARBON IMAGE STACK
+# ============================================================
+
+carbon_bands = []
+
+print("\nBuilding ESA CCI temporal carbon stack...")
+
+for year in BIOMASS_YEARS:
+    print(f"  Processing ESA CCI biomass year: {year}")
+
+    img = clip_image_to_aoi(
+        ee.Image(f"{ESA_CCI_ASSET_PREFIX}/{year}"),
+        aoi_geom,
+    )
+
+    agb = img.select("agb").rename(f"AGB_Mg_ha_{year}")
+    agb_sd = img.select("agb_sd").rename(f"AGB_SD_Mg_ha_{year}")
+
+    agc_density = agb.multiply(CARBON_FRACTION).rename(f"AGC_MgC_ha_{year}")
+    agc_sd_density = agb_sd.multiply(CARBON_FRACTION).rename(f"AGC_SD_MgC_ha_{year}")
+
+    agc_stock = (
+        agc_density
+        .multiply(ee.Image.pixelArea().divide(10000))
+        .rename(f"AGC_stock_MgC_{year}")
+    )
+
+    agc_stock_sd = (
+        agc_sd_density
+        .multiply(ee.Image.pixelArea().divide(10000))
+        .rename(f"AGC_stock_SD_MgC_{year}")
+    )
+
+    carbon_bands.extend([
+        agc_density,
+        agc_sd_density,
+        agc_stock,
+        agc_stock_sd,
+    ])
+
+carbon_stack = ee.Image.cat(carbon_bands).clip(aoi_geom)
+
+agc_density_change = (
+    carbon_stack.select(f"AGC_MgC_ha_{TARGET_CARBON_YEAR}")
+    .subtract(carbon_stack.select(f"AGC_MgC_ha_{REFERENCE_CARBON_YEAR}"))
+    .rename(f"AGC_density_change_MgC_ha_{REFERENCE_CARBON_YEAR}_{TARGET_CARBON_YEAR}")
+)
+
+agc_stock_change = (
+    carbon_stack.select(f"AGC_stock_MgC_{TARGET_CARBON_YEAR}")
+    .subtract(carbon_stack.select(f"AGC_stock_MgC_{REFERENCE_CARBON_YEAR}"))
+    .rename(f"AGC_stock_change_MgC_{REFERENCE_CARBON_YEAR}_{TARGET_CARBON_YEAR}")
+)
+
+carbon_stack = carbon_stack.addBands([
+    agc_density_change,
+    agc_stock_change,
+])
+
+# ============================================================
+# 10. MAPBIOMAS OBSERVED URBAN CONVERSION MASKS
+# ============================================================
+
+mapbiomas = ee.Image(CONFIG["mapbiomas_asset"])
+
+lulc_ref = clip_image_to_aoi(
+    mapbiomas.select(f"classification_{REF_LULC_YEAR}"),
+    aoi_geom,
+)
+
+lulc_target = clip_image_to_aoi(
+    mapbiomas.select(f"classification_{TARGET_LULC_YEAR}"),
+    aoi_geom,
+)
+
+urban_ref = lulc_ref.eq(URBAN_CLASS)
+urban_target = lulc_target.eq(URBAN_CLASS)
+
+observed_new_urban = urban_target.And(urban_ref.Not())
+
+native_ref = lulc_ref.remap(
+    NATIVE_CLASSES,
+    [1] * len(NATIVE_CLASSES),
+    0,
+).eq(1)
+
+native_to_urban = observed_new_urban.And(native_ref)
+
+carbon_exposed_new_urban = (
+    carbon_stack.select(f"AGC_stock_MgC_{REFERENCE_CARBON_YEAR}")
+    .updateMask(observed_new_urban)
+    .rename(f"AGC_exposed_new_urban_MgC_{REFERENCE_CARBON_YEAR}_to_{TARGET_LULC_YEAR}")
+)
+
+carbon_exposed_native_to_urban = (
+    carbon_stack.select(f"AGC_stock_MgC_{REFERENCE_CARBON_YEAR}")
+    .updateMask(native_to_urban)
+    .rename(f"AGC_exposed_native_to_urban_MgC_{REFERENCE_CARBON_YEAR}_to_{TARGET_LULC_YEAR}")
+)
+
+carbon_stack = carbon_stack.addBands([
+    carbon_exposed_new_urban,
+    carbon_exposed_native_to_urban,
+])
+
+# ============================================================
+# 11. EXTRACT CARBON METRICS PER GRID CELL
+# ============================================================
+
+print("\nExtracting temporal carbon metrics per SJC 1-km cell...")
+
+carbon_fc = carbon_stack.reduceRegions(
+    collection=grid_ee,
+    reducer=ee.Reducer.sum().combine(
+        reducer2=ee.Reducer.mean(),
+        sharedInputs=True,
+    ),
+    scale=100,
+    tileScale=4,
+)
+
+carbon_gdf = geemap.ee_to_gdf(carbon_fc)
+
+if carbon_gdf.crs is None:
+    carbon_gdf = carbon_gdf.set_crs("EPSG:4326")
+
+carbon_gdf = carbon_gdf.to_crs(OUTPUT_CRS)
+
+print(f"Carbon grid extracted: {len(carbon_gdf)} cells")
+
+# ============================================================
+# 12. CLEAN COLUMNS AND DERIVE INDICATORS
+# ============================================================
+
+analysis_gdf = carbon_gdf.copy()
+
+if "grid_id" in analysis_gdf.columns and "grid_id" in grid_gdf.columns:
+    area_df = grid_gdf[["grid_id", "grid_area_ha"]].copy()
+
+    if "grid_area_ha" in analysis_gdf.columns:
+        analysis_gdf = analysis_gdf.drop(columns=["grid_area_ha"])
+
+    analysis_gdf = analysis_gdf.merge(
+        area_df,
+        on="grid_id",
+        how="left",
+    )
+
+if "grid_area_ha" not in analysis_gdf.columns:
+    analysis_gdf["grid_area_ha"] = analysis_gdf.geometry.area / 10000
+
+analysis_gdf["grid_area_ha"] = pd.to_numeric(
+    analysis_gdf["grid_area_ha"],
+    errors="coerce",
+).fillna(analysis_gdf.geometry.area / 10000)
+
+for year in BIOMASS_YEARS:
+    density_col = find_col(
+        analysis_gdf,
+        f"AGC_MgC_ha_{year}",
+        suffix="_mean",
+    )
+
+    density_sd_col = find_col(
+        analysis_gdf,
+        f"AGC_SD_MgC_ha_{year}",
+        suffix="_mean",
+    )
+
+    stock_col = find_col(
+        analysis_gdf,
+        f"AGC_stock_MgC_{year}",
+        suffix="_sum",
+    )
+
+    stock_sd_col = find_col(
+        analysis_gdf,
+        f"AGC_stock_SD_MgC_{year}",
+        suffix="_sum",
+    )
+
+    for col in [density_col, density_sd_col, stock_col, stock_sd_col]:
+        analysis_gdf[col] = pd.to_numeric(
+            analysis_gdf[col],
+            errors="coerce",
+        ).fillna(0)
+
+    analysis_gdf[f"carbon_density_MgC_ha_{year}"] = analysis_gdf[density_col]
+    analysis_gdf[f"carbon_density_sd_MgC_ha_{year}"] = analysis_gdf[density_sd_col]
+    analysis_gdf[f"carbon_stock_MgC_{year}"] = analysis_gdf[stock_col]
+    analysis_gdf[f"carbon_stock_sd_MgC_{year}"] = analysis_gdf[stock_sd_col]
+
+density_change_col = find_col(
+    analysis_gdf,
+    f"AGC_density_change_MgC_ha_{REFERENCE_CARBON_YEAR}_{TARGET_CARBON_YEAR}",
+    suffix="_mean",
+)
+
+stock_change_col = find_col(
+    analysis_gdf,
+    f"AGC_stock_change_MgC_{REFERENCE_CARBON_YEAR}_{TARGET_CARBON_YEAR}",
+    suffix="_sum",
+)
+
+exposed_new_col = find_col(
+    analysis_gdf,
+    f"AGC_exposed_new_urban_MgC_{REFERENCE_CARBON_YEAR}_to_{TARGET_LULC_YEAR}",
+    suffix="_sum",
+)
+
+exposed_native_col = find_col(
+    analysis_gdf,
+    f"AGC_exposed_native_to_urban_MgC_{REFERENCE_CARBON_YEAR}_to_{TARGET_LULC_YEAR}",
+    suffix="_sum",
+)
+
+for col in [density_change_col, stock_change_col, exposed_new_col, exposed_native_col]:
+    analysis_gdf[col] = pd.to_numeric(
+        analysis_gdf[col],
+        errors="coerce",
+    ).fillna(0)
+
+analysis_gdf[f"carbon_density_change_MgC_ha_{REFERENCE_CARBON_YEAR}_{TARGET_CARBON_YEAR}"] = analysis_gdf[density_change_col]
+analysis_gdf[f"carbon_stock_change_MgC_{REFERENCE_CARBON_YEAR}_{TARGET_CARBON_YEAR}"] = analysis_gdf[stock_change_col]
+analysis_gdf["carbon_exposed_new_urban_MgC"] = analysis_gdf[exposed_new_col]
+analysis_gdf["carbon_exposed_native_to_urban_MgC"] = analysis_gdf[exposed_native_col]
+
+analysis_gdf[f"carbon_stock_tCO2e_{TARGET_CARBON_YEAR}"] = (
+    analysis_gdf[f"carbon_stock_MgC_{TARGET_CARBON_YEAR}"] * CO2E_FACTOR
+)
+
+analysis_gdf[f"carbon_stock_change_tCO2e_{REFERENCE_CARBON_YEAR}_{TARGET_CARBON_YEAR}"] = (
+    analysis_gdf[f"carbon_stock_change_MgC_{REFERENCE_CARBON_YEAR}_{TARGET_CARBON_YEAR}"] * CO2E_FACTOR
+)
+
+analysis_gdf["carbon_exposed_new_urban_tCO2e"] = (
+    analysis_gdf["carbon_exposed_new_urban_MgC"] * CO2E_FACTOR
+)
+
+analysis_gdf["carbon_exposed_native_to_urban_tCO2e"] = (
+    analysis_gdf["carbon_exposed_native_to_urban_MgC"] * CO2E_FACTOR
+)
+
+analysis_gdf["carbon_conservation_priority"] = (
+    analysis_gdf[f"carbon_density_MgC_ha_{TARGET_CARBON_YEAR}"].rank(pct=True) * 100
+)
+
+loss_component = -analysis_gdf[f"carbon_density_change_MgC_ha_{REFERENCE_CARBON_YEAR}_{TARGET_CARBON_YEAR}"]
+
+analysis_gdf["carbon_loss_risk"] = (
+    loss_component.rank(pct=True) * 100
+)
+
+# ============================================================
+# 13. MERGE WITH NCI-BR AND OBSERVED CONVERSION
+# ============================================================
+
+SYNTHESIS_CANDIDATES = [
+    DIRS["processed"] / "nci_br_sjc_final_scientific_synthesis_map.gpkg",
+    DIRS["processed"] / "nci_br_sjc_evidence_synthesis.gpkg",
+    DIRS["processed"] / "nci_br_real_data_evidence_synthesis_map.gpkg",
+]
+
+synthesis_path = next((p for p in SYNTHESIS_CANDIDATES if p.exists()), None)
+
+if synthesis_path is not None:
+    synthesis_gdf = gpd.read_file(synthesis_path)
+
+    if synthesis_gdf.crs is None:
+        synthesis_gdf = synthesis_gdf.set_crs(OUTPUT_CRS)
+
+    synthesis_gdf = synthesis_gdf.to_crs(OUTPUT_CRS)
+    synthesis_gdf = gpd.clip(synthesis_gdf, muni_plot).reset_index(drop=True)
+
+    keep_cols = [
+        "grid_id",
+        "NCI_BR",
+        f"observed_new_urban_{REF_LULC_YEAR}_{TARGET_LULC_YEAR}_ha",
+        f"native_to_urban_{REF_LULC_YEAR}_{TARGET_LULC_YEAR}_ha",
+        f"NCI_exposed_by_observed_conversion_{REF_LULC_YEAR}_{TARGET_LULC_YEAR}",
+        "final_evidence_class",
+    ]
+
+    keep_cols = [c for c in keep_cols if c in synthesis_gdf.columns]
+
+    if "grid_id" in keep_cols:
+        analysis_gdf = analysis_gdf.merge(
+            synthesis_gdf[keep_cols].drop(columns="geometry", errors="ignore"),
+            on="grid_id",
+            how="left",
+        )
+
+    print(f"NCI-BR merged from: {synthesis_path.name}")
+
+UNCERTAINTY_CANDIDATES = [
+    DIRS["processed"] / "nci_br_sjc_uncertainty_sensitivity_analysis.gpkg",
+    DIRS["processed"] / "nci_br_uncertainty_sensitivity_analysis.gpkg",
+]
+
+uncertainty_path = next((p for p in UNCERTAINTY_CANDIDATES if p.exists()), None)
+
+if uncertainty_path is not None:
+    uncertainty_gdf = gpd.read_file(uncertainty_path)
+
+    keep_unc = [
+        "grid_id",
+        "prob_high_nci_q75",
+        "high_nci_robustness_class",
+    ]
+
+    keep_unc = [c for c in keep_unc if c in uncertainty_gdf.columns]
+
+    if "grid_id" in keep_unc:
+        analysis_gdf = analysis_gdf.merge(
+            uncertainty_gdf[keep_unc].drop(columns="geometry", errors="ignore"),
+            on="grid_id",
+            how="left",
+        )
+
+    print(f"Uncertainty merged from: {uncertainty_path.name}")
+
+numeric_merge_cols = [
+    "NCI_BR",
+    f"observed_new_urban_{REF_LULC_YEAR}_{TARGET_LULC_YEAR}_ha",
+    f"native_to_urban_{REF_LULC_YEAR}_{TARGET_LULC_YEAR}_ha",
+    f"NCI_exposed_by_observed_conversion_{REF_LULC_YEAR}_{TARGET_LULC_YEAR}",
+    "prob_high_nci_q75",
+]
+
+for col in numeric_merge_cols:
+    if col in analysis_gdf.columns:
+        analysis_gdf[col] = pd.to_numeric(
+            analysis_gdf[col],
+            errors="coerce",
+        )
+
+# ============================================================
+# 14. CARBON–NATURAL CAPITAL COUPLING
+# ============================================================
+
+if "NCI_BR" in analysis_gdf.columns:
+    carbon_q75 = analysis_gdf[f"carbon_density_MgC_ha_{TARGET_CARBON_YEAR}"].quantile(0.75)
+    nci_q75 = analysis_gdf["NCI_BR"].quantile(0.75)
+
+    analysis_gdf["high_carbon_2022"] = (
+        analysis_gdf[f"carbon_density_MgC_ha_{TARGET_CARBON_YEAR}"] >= carbon_q75
+    )
+
+    analysis_gdf["high_natural_capital"] = (
+        analysis_gdf["NCI_BR"] >= nci_q75
+    )
+
+    analysis_gdf["high_carbon_high_natural_capital"] = (
+        analysis_gdf["high_carbon_2022"]
+        & analysis_gdf["high_natural_capital"]
+    )
+
+    if "prob_high_nci_q75" in analysis_gdf.columns:
+        analysis_gdf["robust_high_natural_capital"] = (
+            pd.to_numeric(analysis_gdf["prob_high_nci_q75"], errors="coerce") >= 0.75
+        )
+    else:
+        analysis_gdf["robust_high_natural_capital"] = False
+
+    analysis_gdf["high_carbon_robust_high_natural_capital"] = (
+        analysis_gdf["high_carbon_2022"]
+        & analysis_gdf["robust_high_natural_capital"]
+    )
+
+urban_area_col = f"observed_new_urban_{REF_LULC_YEAR}_{TARGET_LULC_YEAR}_ha"
+
+if urban_area_col in analysis_gdf.columns:
+    analysis_gdf["carbon_exposure_per_ha_urban_MgC_ha"] = np.where(
+        analysis_gdf[urban_area_col] > 0,
+        analysis_gdf["carbon_exposed_new_urban_MgC"] / analysis_gdf[urban_area_col],
+        np.nan,
+    )
+
+# ============================================================
+# 15. SUMMARY TABLES
+# ============================================================
+
+trajectory_records = []
+
+for year in BIOMASS_YEARS:
+    trajectory_records.append({
+        "year": year,
+        "total_carbon_stock_MgC": analysis_gdf[f"carbon_stock_MgC_{year}"].sum(),
+        "mean_carbon_density_MgC_ha": analysis_gdf[f"carbon_density_MgC_ha_{year}"].mean(),
+        "total_carbon_stock_sd_MgC": analysis_gdf[f"carbon_stock_sd_MgC_{year}"].sum(),
+        "mean_carbon_density_sd_MgC_ha": analysis_gdf[f"carbon_density_sd_MgC_ha_{year}"].mean(),
+    })
+
+trajectory_df = pd.DataFrame(trajectory_records)
+
+summary_df = pd.DataFrame([
+    {
+        "metric": f"Total above-ground carbon stock in {REFERENCE_CARBON_YEAR}",
+        "value": analysis_gdf[f"carbon_stock_MgC_{REFERENCE_CARBON_YEAR}"].sum(),
+        "unit": "Mg C",
+    },
+    {
+        "metric": f"Total above-ground carbon stock in {TARGET_CARBON_YEAR}",
+        "value": analysis_gdf[f"carbon_stock_MgC_{TARGET_CARBON_YEAR}"].sum(),
+        "unit": "Mg C",
+    },
+    {
+        "metric": f"Net above-ground carbon stock change, {REFERENCE_CARBON_YEAR}-{TARGET_CARBON_YEAR}",
+        "value": analysis_gdf[f"carbon_stock_change_MgC_{REFERENCE_CARBON_YEAR}_{TARGET_CARBON_YEAR}"].sum(),
+        "unit": "Mg C",
+    },
+    {
+        "metric": "Carbon exposed by observed urban expansion",
+        "value": analysis_gdf["carbon_exposed_new_urban_MgC"].sum(),
+        "unit": "Mg C",
+    },
+    {
+        "metric": "Carbon exposed by native-to-urban conversion",
+        "value": analysis_gdf["carbon_exposed_native_to_urban_MgC"].sum(),
+        "unit": "Mg C",
+    },
+    {
+        "metric": "Carbon exposed by observed urban expansion in CO2 equivalent",
+        "value": analysis_gdf["carbon_exposed_new_urban_tCO2e"].sum(),
+        "unit": "t CO2e",
+    },
+    {
+        "metric": f"Mean above-ground carbon density in {TARGET_CARBON_YEAR}",
+        "value": analysis_gdf[f"carbon_density_MgC_ha_{TARGET_CARBON_YEAR}"].mean(),
+        "unit": "Mg C ha-1",
+    },
+    {
+        "metric": "Cells with high carbon and high natural capital",
+        "value": int(analysis_gdf["high_carbon_high_natural_capital"].sum()) if "high_carbon_high_natural_capital" in analysis_gdf.columns else np.nan,
+        "unit": "cells",
+    },
+    {
+        "metric": "Cells with high carbon and robust high natural capital",
+        "value": int(analysis_gdf["high_carbon_robust_high_natural_capital"].sum()) if "high_carbon_robust_high_natural_capital" in analysis_gdf.columns else np.nan,
+        "unit": "cells",
+    },
+])
+
+if "high_carbon_high_natural_capital" in analysis_gdf.columns:
+    coupling_summary = (
+        analysis_gdf.groupby([
+            "high_carbon_2022",
+            "high_natural_capital",
+            "robust_high_natural_capital",
+        ])
+        .agg(
+            n_cells=("grid_id", "count"),
+            total_area_ha=("grid_area_ha", "sum"),
+            mean_NCI_BR=("NCI_BR", "mean"),
+            mean_carbon_density_2022=(f"carbon_density_MgC_ha_{TARGET_CARBON_YEAR}", "mean"),
+            total_carbon_2022_MgC=(f"carbon_stock_MgC_{TARGET_CARBON_YEAR}", "sum"),
+            total_carbon_change_2007_2022_MgC=(f"carbon_stock_change_MgC_{REFERENCE_CARBON_YEAR}_{TARGET_CARBON_YEAR}", "sum"),
+            carbon_exposed_new_urban_MgC=("carbon_exposed_new_urban_MgC", "sum"),
+        )
+        .reset_index()
+    )
+else:
+    coupling_summary = pd.DataFrame()
+
+# ============================================================
+# 16. EXPORT OUTPUTS
+# ============================================================
+
+output_gpkg = DIRS["processed"] / "nci_br_sjc_temporal_carbon_natural_capital_coupling.gpkg"
+output_csv = DIRS["tables"] / "nci_br_sjc_temporal_carbon_natural_capital_coupling.csv"
+trajectory_csv = DIRS["tables"] / "nci_br_sjc_temporal_carbon_trajectory_2007_2022.csv"
+summary_csv = DIRS["tables"] / "nci_br_sjc_temporal_carbon_summary.csv"
+coupling_csv = DIRS["tables"] / "nci_br_sjc_carbon_natural_capital_coupling_summary.csv"
+
+analysis_gdf.to_file(
+    output_gpkg,
+    layer="temporal_carbon_nci_coupling_sjc",
+    driver="GPKG",
+)
+
+analysis_gdf.drop(columns="geometry", errors="ignore").to_csv(
+    output_csv,
+    index=False,
+    encoding="utf-8-sig",
+)
+
+trajectory_df.to_csv(
+    trajectory_csv,
+    index=False,
+    encoding="utf-8-sig",
+)
+
+summary_df.to_csv(
+    summary_csv,
+    index=False,
+    encoding="utf-8-sig",
+)
+
+coupling_summary.to_csv(
+    coupling_csv,
+    index=False,
+    encoding="utf-8-sig",
+)
+
+print("\nTemporal carbon outputs exported:")
+for p in [output_gpkg, output_csv, trajectory_csv, summary_csv, coupling_csv]:
+    print(f"  {p}")
+
+# ============================================================
+# 17. HIGH-QUALITY COMPOSITE FIGURE
+# ============================================================
+
+mpl.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 9,
+    "axes.titlesize": 9.5,
+    "axes.titleweight": "bold",
+    "axes.labelsize": 8.5,
+    "xtick.labelsize": 7,
+    "ytick.labelsize": 7,
+    "legend.fontsize": 7,
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+    "savefig.dpi": FIG_DPI,
+})
+
+plot_gdf = analysis_gdf.to_crs(OUTPUT_CRS).copy()
+
+fig = plt.figure(figsize=(18, 11), dpi=150)
+
+gs = fig.add_gridspec(
+    nrows=3,
+    ncols=3,
+    height_ratios=[1.05, 1.05, 0.85],
+    width_ratios=[1.15, 1.15, 1.00],
+    wspace=0.24,
+    hspace=0.32,
+)
+
+ax_a = fig.add_subplot(gs[0, 0])
+ax_b = fig.add_subplot(gs[0, 1])
+ax_c = fig.add_subplot(gs[0, 2])
+ax_d = fig.add_subplot(gs[1, 0])
+ax_e = fig.add_subplot(gs[1, 1])
+ax_f = fig.add_subplot(gs[1, 2])
+ax_g = fig.add_subplot(gs[2, 0])
+ax_h = fig.add_subplot(gs[2, 1])
+ax_i = fig.add_subplot(gs[2, 2])
+
+# A
+safe_map(
+    plot_gdf,
+    f"carbon_density_MgC_ha_{TARGET_CARBON_YEAR}",
+    ax_a,
+    "YlGn",
+    f"Above-ground carbon density ({TARGET_CARBON_YEAR})",
+    unit_label="Mg C ha⁻¹",
+)
+add_panel_label(ax_a, "a")
+
+# B
+vals = plot_gdf[f"carbon_density_change_MgC_ha_{REFERENCE_CARBON_YEAR}_{TARGET_CARBON_YEAR}"].dropna()
+if len(vals) > 0:
+    vmax_abs = max(abs(float(vals.quantile(0.02))), abs(float(vals.quantile(0.98))), 0.01)
+    norm_div = TwoSlopeNorm(vmin=-vmax_abs, vcenter=0, vmax=vmax_abs)
+else:
+    norm_div = None
+
+safe_map(
+    plot_gdf,
+    f"carbon_density_change_MgC_ha_{REFERENCE_CARBON_YEAR}_{TARGET_CARBON_YEAR}",
+    ax_b,
+    "RdYlGn",
+    f"Carbon density change ({REFERENCE_CARBON_YEAR}–{TARGET_CARBON_YEAR})",
+    unit_label="Mg C ha⁻¹",
+    norm=norm_div,
+)
+add_panel_label(ax_b, "b")
+
+# C
+safe_map(
+    plot_gdf,
+    "carbon_exposed_new_urban_MgC",
+    ax_c,
+    "OrRd",
+    f"Carbon exposed by observed urban expansion\n{REF_LULC_YEAR}–{TARGET_LULC_YEAR}",
+    unit_label="Mg C",
+)
+add_panel_label(ax_c, "c")
+
+# D
+safe_map(
+    plot_gdf,
+    "carbon_exposed_native_to_urban_MgC",
+    ax_d,
+    "Reds",
+    "Carbon exposed by native-to-urban conversion",
+    unit_label="Mg C",
+)
+add_panel_label(ax_d, "d")
+
+# E categorical coupling
+ax_e.set_facecolor("#e6e6e6")
+
+if "high_carbon_high_natural_capital" in plot_gdf.columns:
+    plot_gdf["carbon_nci_class"] = "Other"
+    plot_gdf.loc[
+        plot_gdf["high_carbon_2022"] & ~plot_gdf["high_natural_capital"],
+        "carbon_nci_class",
+    ] = "High carbon only"
+    plot_gdf.loc[
+        ~plot_gdf["high_carbon_2022"] & plot_gdf["high_natural_capital"],
+        "carbon_nci_class",
+    ] = "High natural capital only"
+    plot_gdf.loc[
+        plot_gdf["high_carbon_high_natural_capital"],
+        "carbon_nci_class",
+    ] = "High carbon + high natural capital"
+
+    class_colors = {
+        "High carbon + high natural capital": "#006837",
+        "High carbon only": "#78c679",
+        "High natural capital only": "#2b8cbe",
+        "Other": "#d9d9d9",
+    }
+
+    plot_gdf["carbon_nci_color"] = plot_gdf["carbon_nci_class"].map(class_colors)
+
+    plot_gdf.plot(
+        ax=ax_e,
+        color=plot_gdf["carbon_nci_color"],
+        linewidth=0,
+    )
+
+    handles = [
+        mpatches.Patch(facecolor=color, edgecolor="none", label=label)
+        for label, color in class_colors.items()
+        if label in plot_gdf["carbon_nci_class"].unique()
+    ]
+
+    ax_e.legend(
+        handles=handles,
+        loc="lower left",
+        fontsize=6.5,
+        frameon=True,
+        framealpha=0.92,
+    )
+
+else:
+    plot_gdf.plot(ax=ax_e, color="#d9d9d9", linewidth=0)
+
+overlay_boundary(ax_e)
+apply_extent(ax_e)
+ax_e.set_title("Carbon–natural-capital coupling", loc="left", fontsize=9.5, fontweight="bold")
+add_panel_label(ax_e, "e")
+
+# F scatter
+if "NCI_BR" in plot_gdf.columns:
+    valid = plot_gdf[
+        plot_gdf["NCI_BR"].notna()
+        & plot_gdf[f"carbon_density_MgC_ha_{TARGET_CARBON_YEAR}"].notna()
+    ]
+
+    ax_f.scatter(
+        valid["NCI_BR"],
+        valid[f"carbon_density_MgC_ha_{TARGET_CARBON_YEAR}"],
+        s=10,
+        alpha=0.45,
+        edgecolor="none",
+    )
+
+    if len(valid) > 3:
+        coef = np.polyfit(
+            valid["NCI_BR"],
+            valid[f"carbon_density_MgC_ha_{TARGET_CARBON_YEAR}"],
+            1,
+        )
+
+        xline = np.linspace(valid["NCI_BR"].min(), valid["NCI_BR"].max(), 100)
+        ax_f.plot(xline, coef[0] * xline + coef[1], color="black", linewidth=1.3)
+
+        corr = valid[
+            ["NCI_BR", f"carbon_density_MgC_ha_{TARGET_CARBON_YEAR}"]
+        ].corr().iloc[0, 1]
+
+        ax_f.text(
+            0.97,
+            0.95,
+            f"r = {corr:.3f}",
+            transform=ax_f.transAxes,
+            ha="right",
+            va="top",
+            fontsize=8,
+            bbox=dict(facecolor="white", edgecolor="#bdbdbd", boxstyle="round,pad=0.25"),
+        )
+
+    ax_f.set_xlabel("NCI-BR")
+    ax_f.set_ylabel("Carbon density, Mg C ha⁻¹")
+    ax_f.set_title("Carbon density vs Natural Capital Index", loc="left", fontsize=9.5, fontweight="bold")
+    ax_f.grid(True, linewidth=0.3, alpha=0.5)
+
+else:
+    ax_f.axis("off")
+    ax_f.text(0.5, 0.5, "NCI-BR unavailable", transform=ax_f.transAxes, ha="center", va="center")
+
+add_panel_label(ax_f, "f")
+
+# G trajectory
+ax_g.plot(
+    trajectory_df["year"],
+    trajectory_df["total_carbon_stock_MgC"],
+    marker="o",
+    linewidth=2.2,
+)
+
+ax_g.set_title("Observed above-ground carbon stock trajectory", loc="left", fontsize=9.5, fontweight="bold")
+ax_g.set_xlabel("Year")
+ax_g.set_ylabel("Total above-ground carbon stock, Mg C")
+ax_g.grid(True, linewidth=0.3, alpha=0.5)
+add_panel_label(ax_g, "g")
+
+# H histogram
+ax_h.hist(
+    analysis_gdf[f"carbon_density_MgC_ha_{TARGET_CARBON_YEAR}"].dropna(),
+    bins=25,
+)
+
+ax_h.set_title(f"Distribution of carbon density ({TARGET_CARBON_YEAR})", loc="left", fontsize=9.5, fontweight="bold")
+ax_h.set_xlabel("Mg C ha⁻¹")
+ax_h.set_ylabel("Grid-cell frequency")
+ax_h.grid(True, linewidth=0.3, alpha=0.5)
+add_panel_label(ax_h, "h")
+
+# I summary table
+ax_i.axis("off")
+
+table_df = summary_df.copy()
+table_df["value"] = table_df["value"].map(
+    lambda x: f"{x:,.2f}" if pd.notna(x) else "NA"
+)
+
+tbl = ax_i.table(
+    cellText=table_df[["metric", "value", "unit"]].values,
+    colLabels=["Metric", "Value", "Unit"],
+    loc="center",
+    cellLoc="center",
+    colLoc="center",
+    colWidths=[0.58, 0.24, 0.18],
+)
+
+tbl.auto_set_font_size(False)
+tbl.set_fontsize(5.8)
+tbl.scale(1.0, 1.30)
+
+for (row, col), cell in tbl.get_celld().items():
+    cell.set_edgecolor("#bdbdbd")
+    cell.set_linewidth(0.45)
+
+    if row == 0:
+        cell.set_facecolor("#f0f0f0")
+        cell.set_text_props(weight="bold")
+    else:
+        cell.set_facecolor("white")
+
+ax_i.set_title("Temporal carbon summary", loc="left", fontsize=9.5, fontweight="bold")
+add_panel_label(ax_i, "i")
+
+fig.suptitle(
+    f"Temporal above-ground carbon dynamics and natural-capital coupling — {MUNICIPALITY}, SP",
+    fontsize=14,
+    fontweight="bold",
+    y=0.992,
+)
+
+fig.text(
+    0.02,
+    0.008,
+    "Above-ground biomass is derived from ESA CCI Biomass v6.0 and converted to above-ground carbon using a carbon fraction of 0.47. "
+    "Carbon dynamics are evaluated for 2007–2022 and intersected with observed MapBiomas urban/infrastructure expansion and NCI-BR outputs. "
+    "All results are clipped to the official municipal boundary of São José dos Campos.",
+    fontsize=7.3,
+    color="#4d4d4d",
+)
+
+fig_png = DIRS["figures"] / "figure_17_nci_br_sjc_temporal_carbon_nci_coupling.png"
+fig_pdf = DIRS["figures"] / "figure_17_nci_br_sjc_temporal_carbon_nci_coupling.pdf"
+
+plt.savefig(fig_png, dpi=FIG_DPI, bbox_inches="tight")
+plt.savefig(fig_pdf, dpi=FIG_DPI, bbox_inches="tight")
+plt.show()
+
+print("\nFigure exported:")
+print(f"  {fig_png}")
+print(f"  {fig_pdf}")
+
+# ============================================================
+# 18. METADATA + CHECKSUMS
+# ============================================================
+
+checksums = {
+    fp.name: md5_checksum(fp)
+    for fp in [
+        output_gpkg,
+        output_csv,
+        trajectory_csv,
+        summary_csv,
+        coupling_csv,
+    ]
+    if fp.exists()
+}
+
+checksums_path = DIRS["metadata"] / "nci_br_block17_sjc_temporal_carbon_checksums.json"
+
+with open(checksums_path, "w", encoding="utf-8") as f:
+    json.dump(checksums, f, indent=4, ensure_ascii=False)
+
+block17_metadata = {
+    "block": "17",
+    "version": "sjc_esa_cci_v6_complete",
+    "description": "Temporal above-ground carbon stock and carbon–natural-capital coupling using ESA CCI Biomass v6.0, clipped to São José dos Campos.",
+    "municipality": MUNICIPALITY,
+    "ibge_code": MUNI_CODE,
+    "boundary_source": str(muni_path),
+    "data_status": "Observed biomass product and observed land-cover transitions. No synthetic footprints. No invented carbon factors.",
+    "biomass_dataset": ESA_CCI_ASSET_PREFIX,
+    "biomass_years": BIOMASS_YEARS,
+    "carbon_fraction": CARBON_FRACTION,
+    "carbon_units": "Mg C and tCO2e",
+    "carbon_temporal_window": f"{REFERENCE_CARBON_YEAR}-{TARGET_CARBON_YEAR}",
+    "land_cover_conversion_window": f"{REF_LULC_YEAR}-{TARGET_LULC_YEAR}",
+    "n_grid_cells_sjc": int(len(analysis_gdf)),
+    "outputs": {
+        "carbon_gpkg": str(output_gpkg),
+        "carbon_csv": str(output_csv),
+        "trajectory": str(trajectory_csv),
+        "summary": str(summary_csv),
+        "coupling_summary": str(coupling_csv),
+        "figure_png": str(fig_png),
+        "figure_pdf": str(fig_pdf),
+        "checksums": str(checksums_path),
+    },
+    "created_at": datetime.now().isoformat(),
+}
+
+metadata_path = DIRS["metadata"] / "nci_br_block17_sjc_temporal_carbon_esa_cci_metadata.json"
+
+with open(metadata_path, "w", encoding="utf-8") as f:
+    json.dump(block17_metadata, f, indent=4, ensure_ascii=False)
+
+print(f"\nMetadata saved at: {metadata_path}")
+print(f"Checksums saved at: {checksums_path}")
+
+logger.info("Block 17 completed successfully.")
+
+# ============================================================
+# 19. FINAL SUMMARY
+# ============================================================
+
+print("\n" + "=" * 74)
+print(f"BLOCK 17 — COMPLETED | {MUNICIPALITY}")
+print("=" * 74)
+print(f"  Grid cells — SJC       : {len(analysis_gdf)}")
+print(f"  Biomass years          : {BIOMASS_YEARS}")
+print(f"  Carbon window          : {REFERENCE_CARBON_YEAR}–{TARGET_CARBON_YEAR}")
+print(f"  Land-cover window      : {REF_LULC_YEAR}–{TARGET_LULC_YEAR}")
+print(f"  Total carbon {REFERENCE_CARBON_YEAR} : {analysis_gdf[f'carbon_stock_MgC_{REFERENCE_CARBON_YEAR}'].sum():,.2f} Mg C")
+print(f"  Total carbon {TARGET_CARBON_YEAR}    : {analysis_gdf[f'carbon_stock_MgC_{TARGET_CARBON_YEAR}'].sum():,.2f} Mg C")
+print(f"  Net carbon change      : {analysis_gdf[f'carbon_stock_change_MgC_{REFERENCE_CARBON_YEAR}_{TARGET_CARBON_YEAR}'].sum():,.2f} Mg C")
+print(f"  Carbon exposed urban   : {analysis_gdf['carbon_exposed_new_urban_MgC'].sum():,.2f} Mg C")
+print(f"  Carbon exposed native  : {analysis_gdf['carbon_exposed_native_to_urban_MgC'].sum():,.2f} Mg C")
+if 'high_carbon_high_natural_capital' in analysis_gdf.columns:
+    print(f"  High carbon + high NCI : {int(analysis_gdf['high_carbon_high_natural_capital'].sum())} cells")
+print("=" * 74)
+print("\nNext block: ecosystem service integration and synthesis.")
